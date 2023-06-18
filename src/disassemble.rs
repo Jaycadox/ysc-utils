@@ -1,3 +1,4 @@
+use std::cmp::{max, min};
 use crate::ysc::*;
 use anyhow::{Error, Result};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
@@ -23,13 +24,14 @@ pub struct GlobalSignature {
     enter_offset: Option<i32>,
     previous_opcodes: Option<Vec<u8>>,
     size: usize,
+    hint: usize,
 }
 
 pub struct DisassembledScript {
     pub instructions: Vec<Opcode>,
 }
 
-const PREV_OPCODE_SIG_LENGTH: usize = 30;
+const PREV_OPCODE_SIG_LENGTH: usize = 15;
 
 impl DisassembledScript {
     pub fn new(instructions: Vec<Opcode>) -> Self {
@@ -61,15 +63,17 @@ impl DisassembledScript {
 
         string_buf
     }
-
-    pub fn find_from_signature(&self, signature: &GlobalSignature) -> Option<(&[Opcode], bool)> {
+    fn find_from_signature_given_instructions<'a>(
+        signature: &GlobalSignature,
+        instructions: &'a [Opcode],
+    ) -> Option<(&'a [Opcode], bool)> {
         let mut prev_opcode_answer = 0;
         let mut enter_answer = false;
 
         if let Some(prev_opcodes) = &signature.previous_opcodes {
             let mut current_prev_index = 0;
             let mut i = 0;
-            'search: for op in &self.instructions {
+            'search: for op in instructions {
                 let val = op.enum_index() as u8;
                 if val != prev_opcodes[current_prev_index] {
                     current_prev_index = 0;
@@ -85,25 +89,60 @@ impl DisassembledScript {
             }
 
             if let Some(offset) = &signature.enter_offset {
-                match &self.instructions[prev_opcode_answer - *offset as usize] {
-                    Opcode::Enter { .. } => {
-                        enter_answer = true;
+                if *offset < prev_opcode_answer {
+                    match &instructions[(prev_opcode_answer - *offset) as usize] {
+                        Opcode::Enter { .. } => {
+                            enter_answer = true;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
 
             return Some((
-                &self.instructions[prev_opcode_answer..(prev_opcode_answer + signature.size)],
+                &instructions[prev_opcode_answer as usize..(prev_opcode_answer as usize + signature.size)],
                 enter_answer,
             ));
         }
 
         None
     }
+    pub fn find_from_signatures(&self, signatures: &Vec<GlobalSignature>) -> Option<Vec<(&[Opcode], bool)>> {
+        let mut results = Vec::new();
+        for sig in signatures {
+            if let Some(res) = self.find_from_signature(sig) {
+                results.push(res);
+            }
+        }
 
-    pub fn generate_signature(&self, index_and_size: (usize, usize)) -> GlobalSignature {
-        let (index, size) = index_and_size;
+        if results.is_empty() {
+            None
+        } else {
+            Some(results)
+        }
+    }
+
+    pub fn find_from_signature(&self, signature: &GlobalSignature) -> Option<(&[Opcode], bool)> {
+        return if let Some(res) = DisassembledScript::find_from_signature_given_instructions(
+            &signature,
+            &self.instructions
+                [(max(signature.hint as i64 - 512, 0) as usize)..(min(signature.hint + 512, self.instructions.len() - 1) as usize)],
+        ) {
+            Some(res)
+        } else {
+            DisassembledScript::find_from_signature_given_instructions(
+                &signature,
+                &self.instructions,
+            )
+        }
+    }
+
+    pub fn generate_signatures(&self, indexes_and_sizes: &Vec<(usize, usize)>) -> Vec<GlobalSignature> {
+        indexes_and_sizes.iter().map(|f| self.generate_signature(f)).collect()
+    }
+
+    pub fn generate_signature(&self, index_and_size: &(usize, usize)) -> GlobalSignature {
+        let (index, size) = *index_and_size;
 
         let mut prev_opcode_sig = None;
         if index > PREV_OPCODE_SIG_LENGTH {
@@ -133,6 +172,7 @@ impl DisassembledScript {
             previous_opcodes: prev_opcode_sig,
             enter_offset,
             size,
+            hint: index,
         }
     }
 
@@ -167,24 +207,48 @@ impl DisassembledScript {
         }
     }
 
+    pub fn find_global_references(&self, global_ref: &GlobalReference) -> Option<Vec<(usize, usize)>> {
+        let mut current_offset = 0;
+        const NUM_OF_REFERENCES: usize = 3;
+        let mut references = Vec::with_capacity(NUM_OF_REFERENCES);
+        for _ in 0..NUM_OF_REFERENCES {
+            if let Some(reference) = self.find_global_reference_from(global_ref, current_offset) {
+                references.push(reference);
+                current_offset = reference.0 + reference.1 + 1;
+            } else {
+                break;
+            }
+        }
+
+        if references.is_empty() {
+            None
+        } else {
+            Some(references)
+        }
+    }
+
     pub fn find_global_reference(&self, global_ref: &GlobalReference) -> Option<(usize, usize)> {
-        let mut i = 0;
+        self.find_global_reference_from(global_ref, 0)
+    }
+
+    pub fn find_global_reference_from(&self, global_ref: &GlobalReference, from: usize) -> Option<(usize, usize)> {
+        let mut i = from;
         let len = self.instructions.len();
         let mut in_global = false;
-
+        let empty = global_ref.offsets.is_empty();
         let mut offset_index = 0;
 
         while i < len {
             if let Some(global_value) = DisassembledScript::get_global_index(&self.instructions[i])
             {
                 in_global = global_value == global_ref.index;
-                if global_ref.offsets.is_empty() {
+                if empty && in_global {
                     return Some((i, 1));
                 }
             } else if let Some(offset) =
                 DisassembledScript::get_global_offset_value(&self.instructions[i])
             {
-                if in_global && !global_ref.offsets.is_empty() {
+                if in_global && !empty {
                     if global_ref.offsets[offset_index] == offset {
                         offset_index += 1;
                         if offset_index == global_ref.offsets.len() {
@@ -203,9 +267,6 @@ impl DisassembledScript {
                 offset_index = 0;
             }
 
-            if !in_global {
-                offset_index = 0;
-            }
             i += 1;
         }
 

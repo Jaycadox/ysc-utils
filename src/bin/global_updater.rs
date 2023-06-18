@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use anyhow::{Context, Error, Result};
 use onig::*;
 use ysc_utils::disassemble::*;
@@ -48,20 +49,28 @@ fn run() -> Result<(), Error> {
         .context("Failed to parse new ysc file")?;
 
     let res = old_script
-        .find_global_reference(&global_reference)
+        .find_global_references(&global_reference)
         .context("Failed to find tokens in old script")?;
 
-    let sig = old_script.generate_signature(res);
-    let result = new_script
-        .find_from_signature(&sig)
+    let sig = old_script.generate_signatures(&res);
+    let results = new_script
+        .find_from_signatures(&sig)
         .context("Failed to find tokens in new script")?;
 
-    println!("{}", new_script.get_pretty(result.0));
-    if result.1 {
-        println!("High confidence.")
-    } else {
-        println!("Low confidence.")
-    }
-
+    let candidates = results.iter().map(|f| new_script.get_pretty(f.0)).collect::<Vec<_>>();
+    let final_candidate = find_most_occurring_string(&candidates).context("Could not find most occurring candidate")?;
+    println!("{final_candidate}");
     Ok(())
+}
+
+fn find_most_occurring_string(strings: &[String]) -> Option<&String> {
+    strings
+        .iter()
+        .fold(HashMap::new(), |mut occurrences, string| {
+            *occurrences.entry(string).or_insert(0) += 1;
+            occurrences
+        })
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(&string, _)| string)
 }
