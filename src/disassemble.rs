@@ -30,7 +30,7 @@ pub struct DisassembledScript {
     pub instructions: Vec<Opcode>
 }
 
-const PREV_OPCODE_SIG_LENGTH: usize = 15;
+const PREV_OPCODE_SIG_LENGTH: usize = 30;
 
 impl DisassembledScript {
     pub fn new(instructions: Vec<Opcode>) -> Self {
