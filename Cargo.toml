@@ -5,15 +5,30 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "ysc_utils"
+path = "src/lib.rs"
+
+[[bin]]
+name = "global_updater"
+path = "src/bin/global_updater.rs"
+
+[[bin]]
+name = "script_info"
+path = "src/bin/script_info.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [dependencies]
 bitbuffer = "0.10.9"
-joaat = "0.1.0"
-rayon = "1.6.1"
-rand = "0.8.5"
-itertools = "0.10.5"
 byteorder = "1.4.3"
 anyhow = "1.0.71"
 num_enum = "0.6.1"
 enum_index = "0.2.0"
 enum_index_derive = "0.2.0"
-regex = "1.8.4"
+onig = "6.4.0"

@@ -1,6 +1,7 @@
-use bitbuffer::{BitReadBuffer, BitReadStream, LittleEndian};
 use anyhow::Error;
 use anyhow::Result;
+use bitbuffer::{BitReadBuffer, BitReadStream, LittleEndian};
+use std::path::Path;
 
 #[derive(Default, Debug)]
 pub struct YSCHeader {
@@ -33,25 +34,22 @@ impl YSCHeader {
         stream.set_pos(0)?;
         let mut header = YSCHeader::default();
 
-        let read_int =
-            |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
-                let res = stream.read_int::<i32>(32)?;
-                Ok(res)
-            };
+        let read_int = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
+            let res = stream.read_int::<i32>(32)?;
+            Ok(res)
+        };
 
-        let read_int_large =
-            |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
-                let res = stream.read_int::<i32>(32)?;
-                stream.skip_bits(32)?;
-                Ok(res)
-            };
+        let read_int_large = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
+            let res = stream.read_int::<i32>(32)?;
+            stream.skip_bits(32)?;
+            Ok(res)
+        };
 
-        let read_ptr =
-            |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
-                let res = stream.read_int::<i32>(32)? & 0xFFFFFF;
-                stream.skip_bits(32)?;
-                Ok(res)
-            };
+        let read_ptr = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
+            let res = stream.read_int::<i32>(32)? & 0xFFFFFF;
+            stream.skip_bits(32)?;
+            Ok(res)
+        };
         header.page_base = read_int_large(stream)?;
         header.page_map_ptr = read_ptr(stream)?;
         header.code_block_base_ptr = read_ptr(stream)?;
@@ -92,6 +90,14 @@ pub struct YSCScript {
     pub code_table_offsets: Vec<u64>,
     pub strings: Vec<String>,
     pub code: Vec<u8>,
+}
+
+impl YSCScript {
+    pub fn from_ysc_file(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let src = std::fs::read(path)?;
+        let ysc = YSC::new(&src.clone())?.get_script()?;
+        Ok(ysc)
+    }
 }
 
 impl<'a> YSC<'a> {
