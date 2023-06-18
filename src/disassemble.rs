@@ -209,7 +209,7 @@ impl DisassembledScript {
 
     pub fn find_global_references(&self, global_ref: &GlobalReference) -> Option<Vec<(usize, usize)>> {
         let mut current_offset = 0;
-        const NUM_OF_REFERENCES: usize = 3;
+        const NUM_OF_REFERENCES: usize = 7;
         let mut references = Vec::with_capacity(NUM_OF_REFERENCES);
         for _ in 0..NUM_OF_REFERENCES {
             if let Some(reference) = self.find_global_reference_from(global_ref, current_offset) {

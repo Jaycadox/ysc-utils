@@ -17,6 +17,10 @@ path = "src/bin/global_updater.rs"
 name = "script_info"
 path = "src/bin/script_info.rs"
 
+[[bin]]
+name = "gui"
+path = "src/bin/gui.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -32,3 +36,8 @@ num_enum = "0.6.1"
 enum_index = "0.2.0"
 enum_index_derive = "0.2.0"
 onig = "6.4.0"
+eframe = "0.22.0"
+tinyfiledialogs = "3.9.1"
+serde = "1.0.164"
+serde_json = "1.0.97"
+serde_derive = "1.0.164"
