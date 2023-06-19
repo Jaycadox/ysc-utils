@@ -51,11 +51,8 @@ impl eframe::App for Gui {
                 ui.label("Old .ysc* script");
                 ui.text_edit_singleline(&mut self.old_script);
                 if ui.button("Browse").clicked() {
-                    match tinyfiledialogs::open_file_dialog("Old script", "~", None) {
-                        Some(file) => {
-                            self.old_script = file;
-                        }
-                        None => {}
+                    if let Some(file) = tinyfiledialogs::open_file_dialog("Old script", "~", None) {
+                        self.old_script = file;
                     }
                 }
             });
@@ -64,11 +61,8 @@ impl eframe::App for Gui {
                 ui.label("New .ysc* script");
                 ui.text_edit_singleline(&mut self.new_script);
                 if ui.button("Browse").clicked() {
-                    match tinyfiledialogs::open_file_dialog("New script", "~", None) {
-                        Some(file) => {
-                            self.new_script = file;
-                        }
-                        None => {}
+                    if let Some(file) = tinyfiledialogs::open_file_dialog("New script", "~", None) {
+                        self.new_script = file;
                     }
                 }
             });
@@ -76,11 +70,8 @@ impl eframe::App for Gui {
                 ui.label("Input");
                 let re = ui.text_edit_singleline(&mut self.input);
                 if ui.button("Go").clicked() || re.lost_focus() {
-                    match serde_json::to_string(&self) {
-                        Ok(json) => {
-                            let _ = std::fs::write("./settings.json", json).is_ok();
-                        }
-                        Err(_) => {}
+                    if let Ok(json) = serde_json::to_string(&self) {
+                        let _ = std::fs::write("./settings.json", json).is_ok();
                     }
 
                     match shared::update_global(&self.old_script, &self.new_script, &self.input) {

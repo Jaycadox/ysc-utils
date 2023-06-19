@@ -1,6 +1,7 @@
 use anyhow::Error;
 use anyhow::Result;
 use bitbuffer::{BitReadBuffer, BitReadStream, LittleEndian};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Default, Debug)]
@@ -88,7 +89,8 @@ pub struct YSCScript {
     pub native_table: Vec<u64>,
     pub string_table_offsets: Vec<u64>,
     pub code_table_offsets: Vec<u64>,
-    pub strings: Vec<String>,
+    pub strings: HashMap<usize, String>,
+    pub string_table: Vec<u8>,
     pub code: Vec<u8>,
 }
 
@@ -97,6 +99,38 @@ impl YSCScript {
         let src = std::fs::read(path)?;
         let ysc = YSC::new(&src)?.get_script()?;
         Ok(ysc)
+    }
+
+    pub fn get_string_with_index(&self, index: usize) -> Option<String> {
+        let table = &self.string_table;
+        let mut i = index;
+        let max = table.len();
+
+        let mut string_buf: Vec<u8> = Vec::with_capacity(100);
+
+        if i >= max {
+            return None;
+        }
+
+        while i < max {
+            while i < max {
+                let b = table[i];
+                match b {
+                    0 => {
+                        let converted_str = String::from_utf8_lossy(&string_buf)
+                            .replace('\\', "\\\\")
+                            .replace('\"', "\\\"");
+                        return Some(converted_str);
+                    }
+                    10 => string_buf.extend_from_slice(&[92, 110]), // newline \n
+                    13 => string_buf.extend_from_slice(&[92, 114]), // cartridge return \r
+                    34 => string_buf.extend_from_slice(&[92, 34]),  // quotation \"
+                    _ => string_buf.push(b),
+                }
+                i += 1;
+            }
+        }
+        None
     }
 }
 
@@ -109,12 +143,14 @@ impl<'a> YSC<'a> {
     }
 
     pub fn get_script(&mut self) -> Result<YSCScript, Error> {
+        let string_table = self.get_string_table()?;
         Ok(YSCScript {
             name: self.get_script_name()?,
             native_table: self.get_native_table()?,
             string_table_offsets: self.get_string_table_offsets()?,
             code_table_offsets: self.get_code_table_offsets()?,
-            strings: self.get_strings()?,
+            strings: self.get_strings(&string_table)?,
+            string_table,
             code: self.get_code()?,
         })
     }
@@ -153,9 +189,8 @@ impl<'a> YSC<'a> {
     pub fn get_code(&mut self) -> Result<Vec<u8>, Error> {
         let mut code = Vec::new();
         let code_table_offsets = self.get_code_table_offsets()?;
-        let code_table_count = code_table_offsets.len();
 
-        for i in 0..code_table_count {
+        for (i, offset) in code_table_offsets.iter().enumerate() {
             let table_size = if (i + 1) * 0x4000 >= self.header.code_size as usize {
                 self.header.code_size % 0x4000
             } else {
@@ -163,7 +198,7 @@ impl<'a> YSC<'a> {
             } as usize;
 
             let mut current_table: Vec<u8> = Vec::with_capacity(table_size);
-            self.stream.set_pos((code_table_offsets[i] * 8) as usize)?;
+            self.stream.set_pos((*offset * 8) as usize)?;
             current_table.extend_from_slice(&self.stream.read_bytes(table_size)?);
             code.append(&mut current_table);
         }
@@ -171,13 +206,10 @@ impl<'a> YSC<'a> {
         Ok(code)
     }
 
-    pub fn get_strings(&mut self) -> Result<Vec<String>, Error> {
+    pub fn get_string_table(&mut self) -> Result<Vec<u8>, Error> {
         let string_block_count = (self.header.string_size + 0x3FFF).overflowing_shr(14).0;
         let string_table_offsets = self.get_string_table_offsets()?;
-        let mut table: Vec<u8> = Vec::with_capacity(self.header.string_size as usize);
-        for _ in 0..self.header.string_size as usize {
-            table.push(0);
-        }
+        let mut table: Vec<u8> = vec![0; self.header.string_size as usize];
 
         let mut i = 0;
         let mut off = 0;
@@ -196,32 +228,38 @@ impl<'a> YSC<'a> {
             i += 1;
             off += 0x4000;
         }
-        let mut strings = Vec::new();
+        Ok(table)
+    }
+
+    pub fn get_strings(&mut self, table: &Vec<u8>) -> Result<HashMap<usize, String>, Error> {
+        let mut strings = HashMap::new();
         let mut string_buf: Vec<u8> = Vec::with_capacity(100);
-        let max = table.len();
 
         let mut i = 0;
+        let mut index;
+        let max = table.len();
+
         while i < max {
-            let byte = table[i];
-            match byte {
-                0 => {
-                    strings.push(String::from_utf8_lossy(&string_buf).to_string());
-                    string_buf.clear();
+            index = i;
+            'inner: while i < max {
+                let b = table[i];
+                match b {
+                    0 => {
+                        i += 1;
+                        break 'inner;
+                    }
+                    10 => string_buf.extend_from_slice(&[92, 110]), // newline \n
+                    13 => string_buf.extend_from_slice(&[92, 114]), // cartridge return \r
+                    34 => string_buf.extend_from_slice(&[92, 34]),  // quotation \"
+                    _ => string_buf.push(b),
                 }
-                10 => {
-                    string_buf.extend_from_slice(&[92, 110]); // newline \n
-                }
-                13 => {
-                    string_buf.extend_from_slice(&[92, 114]); // cartridge return \r
-                }
-                34 => {
-                    string_buf.extend_from_slice(&[92, 34]); // quotation \"
-                }
-                _ => {
-                    string_buf.push(byte);
-                }
+                i += 1;
             }
-            i += 1;
+            let converted_str = String::from_utf8_lossy(&string_buf)
+                .replace('\\', "\\\\")
+                .replace('\"', "\\\"");
+            strings.insert(index, converted_str.to_string());
+            string_buf.clear();
         }
 
         Ok(strings)

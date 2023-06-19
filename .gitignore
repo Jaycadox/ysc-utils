@@ -5,3 +5,4 @@
 *.ysc.full
 *.c
 *.json
+*.disasm

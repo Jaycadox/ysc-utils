@@ -72,8 +72,7 @@ impl DisassembledScript {
 
         if let Some(prev_opcodes) = &signature.previous_opcodes {
             let mut current_prev_index = 0;
-            let mut i = 0;
-            'search: for op in instructions {
+            'search: for (i, op) in instructions.iter().enumerate() {
                 let val = op.enum_index() as u8;
                 if val != prev_opcodes[current_prev_index] {
                     current_prev_index = 0;
@@ -85,23 +84,20 @@ impl DisassembledScript {
                         break 'search;
                     }
                 }
-                i += 1;
             }
 
             if let Some(offset) = &signature.enter_offset {
-                if *offset < prev_opcode_answer {
-                    match &instructions[(prev_opcode_answer - *offset) as usize] {
-                        Opcode::Enter { .. } => {
-                            enter_answer = true;
-                        }
-                        _ => {}
+                if *offset < prev_opcode_answer as i32 {
+                    if let Opcode::Enter { .. } =
+                        &instructions[prev_opcode_answer - *offset as usize]
+                    {
+                        enter_answer = true;
                     }
                 }
             }
 
             return Some((
-                &instructions
-                    [prev_opcode_answer as usize..(prev_opcode_answer as usize + signature.size)],
+                &instructions[prev_opcode_answer..(prev_opcode_answer + signature.size)],
                 enter_answer,
             ));
         }
@@ -143,7 +139,7 @@ impl DisassembledScript {
 
     pub fn generate_signatures(
         &self,
-        indexes_and_sizes: &Vec<(usize, usize)>,
+        indexes_and_sizes: &[(usize, usize)],
     ) -> Vec<GlobalSignature> {
         indexes_and_sizes
             .iter()
@@ -169,12 +165,9 @@ impl DisassembledScript {
                 break;
             }
             let opcode = &self.instructions[index - offset];
-            match opcode {
-                Opcode::Enter { .. } => {
-                    enter_offset = Some(offset as i32);
-                    break;
-                }
-                _ => {}
+            if let Opcode::Enter { .. } = opcode {
+                enter_offset = Some(offset as i32);
+                break;
             }
         }
 
@@ -307,9 +300,9 @@ impl<'a> Disassembler<'a> {
         let mut cursor = Cursor::new(&self.script.code[..]);
         cursor.set_position(0);
 
+        // char* func_2098(var uParam0, var uParam1, int iParam2) // Position - 0x93143
         let mut opcodes = Vec::new();
         while cursor.position() < self.script.code.len() as u64 {
-            self.current_stack_top = 0;
             let inst = self.disassemble_opcode(&mut cursor)?;
             opcodes.push(inst);
         }
@@ -584,9 +577,23 @@ impl<'a> Disassembler<'a> {
                     entries,
                 })
             }
-            RawOpcode::String => Ok(Opcode::String {
-                value: self.script.strings[self.current_stack_top as usize].to_string(),
-            }),
+            RawOpcode::String => {
+                let key = &(self.current_stack_top as usize);
+                if self.script.strings.contains_key(key) {
+                    Ok(Opcode::String {
+                        index: *key,
+                        value: self.script.strings[key].to_string(),
+                    })
+                } else {
+                    Ok(Opcode::String {
+                        index: *key,
+                        value: self
+                            .script
+                            .get_string_with_index(*key)
+                            .unwrap_or("!!! [disassembler] Unable to find string !!!".to_owned()),
+                    })
+                }
+            }
             RawOpcode::StringHash => Ok(Opcode::StringHash),
             RawOpcode::TextLabelAssignString => Ok(Opcode::TextLabelAssignString {
                 size: cursor.read_u8()?,
@@ -880,6 +887,7 @@ pub enum Opcode {
         entries: Vec<SwitchEntry>,
     },
     String {
+        index: usize,
         value: String,
     },
     StringHash,

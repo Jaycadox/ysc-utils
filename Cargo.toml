@@ -21,6 +21,10 @@ path = "src/bin/script_info.rs"
 name = "gui"
 path = "src/bin/gui.rs"
 
+[[bin]]
+name = "basic_disassemble"
+path = "src/bin/basic_disassemble.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

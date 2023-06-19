@@ -14,11 +14,9 @@ fn extract_numbers(input: &str) -> Vec<u32> {
     let mut numbers = Vec::new();
 
     for capture in re.captures_iter(&input) {
-        for sc in capture.iter() {
-            if let Some(number) = sc {
-                if let Ok(num) = number.to_string().parse() {
-                    numbers.push(num);
-                }
+        for number in capture.iter().flatten() {
+            if let Ok(num) = number.to_string().parse() {
+                numbers.push(num);
             }
         }
     }
