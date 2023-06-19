@@ -12,18 +12,37 @@ fn main() {
 fn start() -> Result<(), Error> {
     let args = std::env::args().skip(1).collect::<Vec<String>>();
 
-    if args.is_empty() || args.len() != 1 {
-        println!("Usage: basic_disassemble %ysc_script%");
-        println!("Example: basic_disasemble freemode.ysc.full");
+    if args.is_empty() || args.len() > 2 {
+        println!("Usage: basic_disassemble %ysc_script% (optional: function number/index)");
+        println!("Example  : basic_disasemble freemode.ysc.full");
+        println!("Example 2: basic_disasemble freemode.ysc.full func_305");
         return Ok(());
     }
 
+    let specified_function_index_str = args.get(1);
+    let mut specified_function_index: i32 = -1;
+
     let script = DisassembledScript::from_ysc_file(&args[0])
         .context("Failed to read/parse/disassemble ysc file")?;
-    let out_file_name = format!("./{}.disasm", &args[0]);
 
-    let out = std::fs::File::create(&out_file_name).context("Failed to create output file")?;
-    let mut wr = std::io::BufWriter::new(out);
+    let mut wr: Box<dyn Write>;
+
+
+    match specified_function_index_str {
+        Some(index) => {
+            wr = Box::new(std::io::BufWriter::new(std::io::stdout()));
+            specified_function_index = index.replace("func_", "").parse()?;
+            specified_function_index += 1;
+        }
+        _ => {
+            let out_file_name = format!("./{}.disasm", &args[0]);
+            println!("Writing to: {out_file_name}...");
+            let out = std::fs::File::create(&out_file_name).context("Failed to create output file")?;
+            wr = Box::new(std::io::BufWriter::new(out));
+        }
+    }
+
+
 
     let instructions = script.instructions;
 
@@ -34,6 +53,10 @@ fn start() -> Result<(), Error> {
 
         match &inst {
             Opcode::Enter { .. } => {
+                if func_index == specified_function_index {
+                    break;
+                }
+
                 function_comment = format!(" /* func_{func_index} */");
                 func_index += 1;
             }
@@ -42,14 +65,15 @@ fn start() -> Result<(), Error> {
             }
         }
 
-        let dop = DisassembledOpcode::from(inst);
-        let out = format!("{padding}{dop}{function_comment}\n");
-        let _ = wr.write(out.as_ref())?;
+        if specified_function_index == -1 || func_index == specified_function_index {
+            let dop = DisassembledOpcode::from(inst);
+            let out = format!("{padding}{dop}{function_comment}\n");
+            let _ = wr.write(out.as_ref())?;
+        }
+
     }
 
     wr.flush()?;
-
-    println!("Wrote to: {out_file_name}");
 
     Ok(())
 }
