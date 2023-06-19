@@ -29,6 +29,10 @@ path = "src/bin/basic_disassemble.rs"
 name = "strings"
 path = "src/bin/strings.rs"
 
+[[bin]]
+name = "native_table"
+path = "src/bin/native_table.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
