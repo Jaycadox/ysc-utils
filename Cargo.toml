@@ -25,6 +25,10 @@ path = "src/bin/gui.rs"
 name = "basic_disassemble"
 path = "src/bin/basic_disassemble.rs"
 
+[[bin]]
+name = "strings"
+path = "src/bin/strings.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

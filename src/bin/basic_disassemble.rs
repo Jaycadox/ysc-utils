@@ -25,24 +25,12 @@ fn start() -> Result<(), Error> {
     let script = DisassembledScript::from_ysc_file(&args[0])
         .context("Failed to read/parse/disassemble ysc file")?;
 
-    let mut wr: Box<dyn Write>;
+    let mut wr = Box::new(std::io::BufWriter::new(std::io::stdout()));
 
-
-    match specified_function_index_str {
-        Some(index) => {
-            wr = Box::new(std::io::BufWriter::new(std::io::stdout()));
-            specified_function_index = index.replace("func_", "").parse()?;
-            specified_function_index += 1;
-        }
-        _ => {
-            let out_file_name = format!("./{}.disasm", &args[0]);
-            println!("Writing to: {out_file_name}...");
-            let out = std::fs::File::create(&out_file_name).context("Failed to create output file")?;
-            wr = Box::new(std::io::BufWriter::new(out));
-        }
+    if let Some(index) = specified_function_index_str {
+        specified_function_index = index.replace("func_", "").parse()?;
+        specified_function_index += 1;
     }
-
-
 
     let instructions = script.instructions;
 
@@ -70,7 +58,6 @@ fn start() -> Result<(), Error> {
             let out = format!("{padding}{dop}{function_comment}\n");
             let _ = wr.write(out.as_ref())?;
         }
-
     }
 
     wr.flush()?;
