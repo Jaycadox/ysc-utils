@@ -27,15 +27,12 @@ impl Gui {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         if std::path::Path::exists("./settings.json".as_ref()) {
             return match std::fs::read_to_string("./settings.json") {
-                Ok(content) => {
-                    match serde_json::from_str::<Self>(&content) {
-                        Ok(s) => s,
-                        _ => Default::default()
-                    }
-                }
-                Err(_) => Default::default()
-            }
-
+                Ok(content) => match serde_json::from_str::<Self>(&content) {
+                    Ok(s) => s,
+                    _ => Default::default(),
+                },
+                Err(_) => Default::default(),
+            };
         }
         Default::default()
     }
@@ -81,7 +78,7 @@ impl eframe::App for Gui {
                 if ui.button("Go").clicked() || re.lost_focus() {
                     match serde_json::to_string(&self) {
                         Ok(json) => {
-                            let _ = std::fs::write("./settings.json", &json).is_ok();
+                            let _ = std::fs::write("./settings.json", json).is_ok();
                         }
                         Err(_) => {}
                     }
@@ -94,7 +91,6 @@ impl eframe::App for Gui {
                             self.output = format!("Error: {}", text);
                         }
                     }
-
                 }
             });
             ui.horizontal(|ui| {
@@ -104,7 +100,6 @@ impl eframe::App for Gui {
                     // todo
                 }
             });
-
         });
     }
 }

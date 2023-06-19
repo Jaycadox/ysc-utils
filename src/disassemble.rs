@@ -1,10 +1,10 @@
-use std::cmp::{max, min};
 use crate::ysc::*;
 use anyhow::{Error, Result};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use enum_index::*;
 use enum_index_derive::*;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use std::cmp::{max, min};
 use std::io::{Cursor, Seek, SeekFrom};
 use std::path::Path;
 
@@ -100,14 +100,18 @@ impl DisassembledScript {
             }
 
             return Some((
-                &instructions[prev_opcode_answer as usize..(prev_opcode_answer as usize + signature.size)],
+                &instructions
+                    [prev_opcode_answer as usize..(prev_opcode_answer as usize + signature.size)],
                 enter_answer,
             ));
         }
 
         None
     }
-    pub fn find_from_signatures(&self, signatures: &Vec<GlobalSignature>) -> Option<Vec<(&[Opcode], bool)>> {
+    pub fn find_from_signatures(
+        &self,
+        signatures: &Vec<GlobalSignature>,
+    ) -> Option<Vec<(&[Opcode], bool)>> {
         let mut results = Vec::new();
         for sig in signatures {
             if let Some(res) = self.find_from_signature(sig) {
@@ -124,21 +128,27 @@ impl DisassembledScript {
 
     pub fn find_from_signature(&self, signature: &GlobalSignature) -> Option<(&[Opcode], bool)> {
         return if let Some(res) = DisassembledScript::find_from_signature_given_instructions(
-            &signature,
-            &self.instructions
-                [(max(signature.hint as i64 - 512, 0) as usize)..(min(signature.hint + 512, self.instructions.len() - 1) as usize)],
+            signature,
+            &self.instructions[(max(signature.hint as i64 - 512, 0) as usize)
+                ..min(signature.hint + 512, self.instructions.len() - 1)],
         ) {
             Some(res)
         } else {
             DisassembledScript::find_from_signature_given_instructions(
-                &signature,
+                signature,
                 &self.instructions,
             )
-        }
+        };
     }
 
-    pub fn generate_signatures(&self, indexes_and_sizes: &Vec<(usize, usize)>) -> Vec<GlobalSignature> {
-        indexes_and_sizes.iter().map(|f| self.generate_signature(f)).collect()
+    pub fn generate_signatures(
+        &self,
+        indexes_and_sizes: &Vec<(usize, usize)>,
+    ) -> Vec<GlobalSignature> {
+        indexes_and_sizes
+            .iter()
+            .map(|f| self.generate_signature(f))
+            .collect()
     }
 
     pub fn generate_signature(&self, index_and_size: &(usize, usize)) -> GlobalSignature {
@@ -181,9 +191,9 @@ impl DisassembledScript {
             Opcode::GlobalU16 { index } => Some(*index as u32),
             Opcode::GlobalU16Store { index } => Some(*index as u32),
             Opcode::GlobalU16Load { index } => Some(*index as u32),
-            Opcode::GlobalU24 { index } => Some(*index as u32),
-            Opcode::GlobalU24Store { index } => Some(*index as u32),
-            Opcode::GlobalU24Load { index } => Some(*index as u32),
+            Opcode::GlobalU24 { index } => Some(*index),
+            Opcode::GlobalU24Store { index } => Some(*index),
+            Opcode::GlobalU24Load { index } => Some(*index),
             _ => None,
         }
     }
@@ -196,7 +206,7 @@ impl DisassembledScript {
             Opcode::IoffsetS16 { offset } => Some(*offset as u32),
             Opcode::IoffsetS16Load { offset } => Some(*offset as u32),
             Opcode::IoffsetS16Store { offset } => Some(*offset as u32),
-            Opcode::PushConstU24 { num } => Some(*num as u32),
+            Opcode::PushConstU24 { num } => Some(*num),
             Opcode::ArrayU8 { size } => Some(*size as u32),
             Opcode::ArrayU8Store { size } => Some(*size as u32),
             Opcode::ArrayU8Load { size } => Some(*size as u32),
@@ -207,7 +217,10 @@ impl DisassembledScript {
         }
     }
 
-    pub fn find_global_references(&self, global_ref: &GlobalReference) -> Option<Vec<(usize, usize)>> {
+    pub fn find_global_references(
+        &self,
+        global_ref: &GlobalReference,
+    ) -> Option<Vec<(usize, usize)>> {
         let mut current_offset = 0;
         const NUM_OF_REFERENCES: usize = 7;
         let mut references = Vec::with_capacity(NUM_OF_REFERENCES);
@@ -231,7 +244,11 @@ impl DisassembledScript {
         self.find_global_reference_from(global_ref, 0)
     }
 
-    pub fn find_global_reference_from(&self, global_ref: &GlobalReference, from: usize) -> Option<(usize, usize)> {
+    pub fn find_global_reference_from(
+        &self,
+        global_ref: &GlobalReference,
+        from: usize,
+    ) -> Option<(usize, usize)> {
         let mut i = from;
         let len = self.instructions.len();
         let mut in_global = false;

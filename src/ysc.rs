@@ -95,14 +95,14 @@ pub struct YSCScript {
 impl YSCScript {
     pub fn from_ysc_file(path: impl AsRef<Path>) -> Result<Self, Error> {
         let src = std::fs::read(path)?;
-        let ysc = YSC::new(&src.clone())?.get_script()?;
+        let ysc = YSC::new(&src)?.get_script()?;
         Ok(ysc)
     }
 }
 
 impl<'a> YSC<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self, Error> {
-        let buffer = BitReadBuffer::new(&data, LittleEndian);
+        let buffer = BitReadBuffer::new(data, LittleEndian);
         let mut stream = BitReadStream::new(buffer);
         let header = YSCHeader::new(&mut stream)?;
         Ok(YSC { stream, header })

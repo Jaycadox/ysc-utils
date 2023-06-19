@@ -13,7 +13,7 @@ fn main() {
     let new_script_path = args.remove(0);
     let input = args.remove(0);
 
-    match shared::update_global(&old_script_path, &new_script_path, &input) {
+    match shared::update_global(old_script_path, new_script_path, &input) {
         Ok(str) => {
             println!("{str}");
         }
