@@ -1,7 +1,8 @@
 use anyhow::{Context, Error, Result};
 use std::fmt::Formatter;
 use std::io::Write;
-use ysc_utils::disassemble::{DisassembledScript, Opcode};
+use ysc_utils::disassemble::{Disassembler, Opcode};
+use ysc_utils::ysc::YSCScript;
 
 fn main() {
     if let Err(err) = start() {
@@ -20,44 +21,30 @@ fn start() -> Result<(), Error> {
     }
 
     let specified_function_index_str = args.get(1);
-    let mut specified_function_index: i32 = -1;
+    let mut func_index: Option<usize> = None;
 
-    let script = DisassembledScript::from_ysc_file(&args[0])
-        .context("Failed to read/parse/disassemble ysc file")?;
+    let script =
+        YSCScript::from_ysc_file(&args[0]).context("Failed to read/parse/disassemble ysc file")?;
 
     let mut wr = Box::new(std::io::BufWriter::new(std::io::stdout()));
 
     if let Some(index) = specified_function_index_str {
-        specified_function_index = index.replace("func_", "").parse()?;
-        specified_function_index += 1;
+        let val: usize = index.replace("func_", "").parse()?;
+        func_index = Some(val + 1);
     }
 
-    let instructions = script.instructions;
+    let script = Disassembler::new(&script).disassemble(func_index)?;
 
-    let mut func_index = 0;
-    for inst in instructions {
+    for inst in script.instructions {
         let mut padding = "".to_owned();
-        let mut function_comment = "".to_owned();
 
-        match &inst {
-            Opcode::Enter { .. } => {
-                if func_index == specified_function_index {
-                    break;
-                }
-
-                function_comment = format!(" /* func_{func_index} */");
-                func_index += 1;
-            }
-            _ => {
-                padding = "    ".to_owned();
-            }
+        if !matches!(inst, Opcode::Enter { .. }) {
+            padding = "    ".to_owned();
         }
 
-        if specified_function_index == -1 || func_index == specified_function_index {
-            let dop = DisassembledOpcode::from(inst);
-            let out = format!("{padding}{dop}{function_comment}\n");
-            let _ = wr.write(out.as_ref())?;
-        }
+        let dop = DisassembledOpcode::from(inst);
+        let out = format!("{padding}{dop}\n");
+        let _ = wr.write(out.as_ref())?;
     }
 
     wr.flush()?;
@@ -67,7 +54,7 @@ fn start() -> Result<(), Error> {
 
 struct DisassembledOpcode {
     name: &'static str,
-    operands: Option<Vec<usize>>,
+    operands: Option<Vec<i128>>,
     comment: Option<String>,
 }
 
@@ -85,97 +72,106 @@ impl DisassembledOpcode {
     fn get_comment(op: &Opcode) -> Option<String> {
         match op {
             Opcode::String { value, .. } => Some(value.to_string()),
+            Opcode::Enter { index, .. } if index.is_some() => {
+                Some(format!("func_{}", index.unwrap()))
+            }
+            Opcode::Call { func_index, .. } if func_index.is_some() => {
+                Some(format!("func_{}", func_index.unwrap()))
+            }
+            Opcode::Native { native_hash, .. } => {
+                Some(format!("0x{:0X}", native_hash))
+            }
             _ => None,
         }
     }
 
-    fn get_operands(op: &Opcode) -> Option<Vec<usize>> {
+    fn get_operands(op: &Opcode) -> Option<Vec<i128>> {
         match op {
-            Opcode::PushConstU8 { one } => Some(vec![*one as usize]),
-            Opcode::PushConstU8U8 { one, two } => Some(vec![*one as usize, *two as usize]),
+            Opcode::PushConstU8 { one } => Some(vec![*one as i128]),
+            Opcode::PushConstU8U8 { one, two } => Some(vec![*one as i128, *two as i128]),
             Opcode::PushConstU8U8U8 { two, one, three } => {
-                Some(vec![*one as usize, *two as usize, *three as usize])
+                Some(vec![*one as i128, *two as i128, *three as i128])
             }
-            Opcode::PushConstU32 { one } => Some(vec![*one as usize]),
-            Opcode::PushConstF { one } => Some(vec![*one as usize]),
+            Opcode::PushConstU32 { one } => Some(vec![*one as i128]),
+            Opcode::PushConstF { one } => Some(vec![*one as i128]),
             Opcode::Native {
-                native_hash,
                 native_table_index,
                 num_args,
                 num_returns,
+                ..
             } => Some(vec![
-                *native_hash as usize,
-                *native_table_index as usize,
-                *num_args as usize,
-                *num_returns as usize,
+                *num_args as i128,
+                *num_returns as i128,
+                *native_table_index as i128,
             ]),
             Opcode::Enter {
                 arg_count,
                 stack_variables,
                 skip,
+                ..
             } => Some(vec![
-                *arg_count as usize,
-                *stack_variables as usize,
-                *skip as usize,
+                *arg_count as i128,
+                *stack_variables as i128,
+                *skip as i128,
             ]),
             Opcode::Leave {
                 arg_count,
                 return_address_index,
-            } => Some(vec![*arg_count as usize, *return_address_index as usize]),
-            Opcode::ArrayU8 { size } => Some(vec![*size as usize]),
-            Opcode::ArrayU8Load { size } => Some(vec![*size as usize]),
-            Opcode::ArrayU8Store { size } => Some(vec![*size as usize]),
-            Opcode::LocalU8 { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::LocalU8Load { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::LocalU8Store { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::StaticU8 { static_var_index } => Some(vec![*static_var_index as usize]),
-            Opcode::StaticU8Load { static_var_index } => Some(vec![*static_var_index as usize]),
-            Opcode::StaticU8Store { static_var_index } => Some(vec![*static_var_index as usize]),
-            Opcode::IaddU8 { num } => Some(vec![*num as usize]),
-            Opcode::ImulU8 { num } => Some(vec![*num as usize]),
-            Opcode::IoffsetU8 { offset } => Some(vec![*offset as usize]),
-            Opcode::IoffsetU8Load { offset } => Some(vec![*offset as usize]),
-            Opcode::IoffsetU8Store { offset } => Some(vec![*offset as usize]),
-            Opcode::PushConstS16 { num } => Some(vec![*num as usize]),
-            Opcode::IaddS16 { num } => Some(vec![*num as usize]),
-            Opcode::ImulS16 { num } => Some(vec![*num as usize]),
-            Opcode::IoffsetS16 { offset } => Some(vec![*offset as usize]),
-            Opcode::IoffsetS16Load { offset } => Some(vec![*offset as usize]),
-            Opcode::IoffsetS16Store { offset } => Some(vec![*offset as usize]),
-            Opcode::ArrayU16 { size } => Some(vec![*size as usize]),
-            Opcode::ArrayU16Load { size } => Some(vec![*size as usize]),
-            Opcode::ArrayU16Store { size } => Some(vec![*size as usize]),
-            Opcode::LocalU16 { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::LocalU16Load { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::LocalU16Store { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::StaticU16 { static_var_index } => Some(vec![*static_var_index as usize]),
-            Opcode::StaticU16Load { static_var_index } => Some(vec![*static_var_index as usize]),
-            Opcode::StaticU16Store { static_var_index } => Some(vec![*static_var_index as usize]),
-            Opcode::GlobalU16 { index } => Some(vec![*index as usize]),
-            Opcode::GlobalU16Load { index } => Some(vec![*index as usize]),
-            Opcode::GlobalU16Store { index } => Some(vec![*index as usize]),
-            Opcode::J { offset } => Some(vec![*offset as usize]),
-            Opcode::Jz { offset } => Some(vec![*offset as usize]),
-            Opcode::IEqJz { offset } => Some(vec![*offset as usize]),
-            Opcode::INeJz { offset } => Some(vec![*offset as usize]),
-            Opcode::IGtJz { offset } => Some(vec![*offset as usize]),
-            Opcode::IGeJz { offset } => Some(vec![*offset as usize]),
-            Opcode::ILtJz { offset } => Some(vec![*offset as usize]),
-            Opcode::ILeJz { offset } => Some(vec![*offset as usize]),
-            Opcode::Call { location } => Some(vec![*location as usize]),
-            Opcode::LocalU24 { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::LocalU24Load { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::LocalU24Store { frame_index } => Some(vec![*frame_index as usize]),
-            Opcode::GlobalU24 { index } => Some(vec![*index as usize]),
-            Opcode::GlobalU24Load { index } => Some(vec![*index as usize]),
-            Opcode::GlobalU24Store { index } => Some(vec![*index as usize]),
-            Opcode::PushConstU24 { num } => Some(vec![*num as usize]),
-            Opcode::Switch { num_of_entries, .. } => Some(vec![*num_of_entries as usize]),
-            Opcode::String { index, .. } => Some(vec![*index]),
-            Opcode::TextLabelAssignString { size } => Some(vec![*size as usize]),
-            Opcode::TextLabelAssignInt { size } => Some(vec![*size as usize]),
-            Opcode::TextLabelAppendString { size } => Some(vec![*size as usize]),
-            Opcode::TextLabelAppendInt { size } => Some(vec![*size as usize]),
+            } => Some(vec![*arg_count as i128, *return_address_index as i128]),
+            Opcode::ArrayU8 { size } => Some(vec![*size as i128]),
+            Opcode::ArrayU8Load { size } => Some(vec![*size as i128]),
+            Opcode::ArrayU8Store { size } => Some(vec![*size as i128]),
+            Opcode::LocalU8 { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::LocalU8Load { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::LocalU8Store { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::StaticU8 { static_var_index } => Some(vec![*static_var_index as i128]),
+            Opcode::StaticU8Load { static_var_index } => Some(vec![*static_var_index as i128]),
+            Opcode::StaticU8Store { static_var_index } => Some(vec![*static_var_index as i128]),
+            Opcode::IaddU8 { num } => Some(vec![*num as i128]),
+            Opcode::ImulU8 { num } => Some(vec![*num as i128]),
+            Opcode::IoffsetU8 { offset } => Some(vec![*offset as i128]),
+            Opcode::IoffsetU8Load { offset } => Some(vec![*offset as i128]),
+            Opcode::IoffsetU8Store { offset } => Some(vec![*offset as i128]),
+            Opcode::PushConstS16 { num } => Some(vec![*num as i128]),
+            Opcode::IaddS16 { num } => Some(vec![*num as i128]),
+            Opcode::ImulS16 { num } => Some(vec![*num as i128]),
+            Opcode::IoffsetS16 { offset } => Some(vec![*offset as i128]),
+            Opcode::IoffsetS16Load { offset } => Some(vec![*offset as i128]),
+            Opcode::IoffsetS16Store { offset } => Some(vec![*offset as i128]),
+            Opcode::ArrayU16 { size } => Some(vec![*size as i128]),
+            Opcode::ArrayU16Load { size } => Some(vec![*size as i128]),
+            Opcode::ArrayU16Store { size } => Some(vec![*size as i128]),
+            Opcode::LocalU16 { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::LocalU16Load { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::LocalU16Store { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::StaticU16 { static_var_index } => Some(vec![*static_var_index as i128]),
+            Opcode::StaticU16Load { static_var_index } => Some(vec![*static_var_index as i128]),
+            Opcode::StaticU16Store { static_var_index } => Some(vec![*static_var_index as i128]),
+            Opcode::GlobalU16 { index } => Some(vec![*index as i128]),
+            Opcode::GlobalU16Load { index } => Some(vec![*index as i128]),
+            Opcode::GlobalU16Store { index } => Some(vec![*index as i128]),
+            Opcode::J { offset } => Some(vec![*offset as i128]),
+            Opcode::Jz { offset } => Some(vec![*offset as i128]),
+            Opcode::IEqJz { offset } => Some(vec![*offset as i128]),
+            Opcode::INeJz { offset } => Some(vec![*offset as i128]),
+            Opcode::IGtJz { offset } => Some(vec![*offset as i128]),
+            Opcode::IGeJz { offset } => Some(vec![*offset as i128]),
+            Opcode::ILtJz { offset } => Some(vec![*offset as i128]),
+            Opcode::ILeJz { offset } => Some(vec![*offset as i128]),
+            Opcode::Call { location, .. } => Some(vec![*location as i128]),
+            Opcode::LocalU24 { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::LocalU24Load { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::LocalU24Store { frame_index } => Some(vec![*frame_index as i128]),
+            Opcode::GlobalU24 { index } => Some(vec![*index as i128]),
+            Opcode::GlobalU24Load { index } => Some(vec![*index as i128]),
+            Opcode::GlobalU24Store { index } => Some(vec![*index as i128]),
+            Opcode::PushConstU24 { num } => Some(vec![*num as i128]),
+            Opcode::Switch { num_of_entries, .. } => Some(vec![*num_of_entries as i128]),
+            Opcode::String { index, .. } => Some(vec![*index as i128]),
+            Opcode::TextLabelAssignString { size } => Some(vec![*size as i128]),
+            Opcode::TextLabelAssignInt { size } => Some(vec![*size as i128]),
+            Opcode::TextLabelAppendString { size } => Some(vec![*size as i128]),
+            Opcode::TextLabelAppendInt { size } => Some(vec![*size as i128]),
             _ => None,
         }
     }

@@ -5,6 +5,7 @@ use enum_index::*;
 use enum_index_derive::*;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::io::{Cursor, Seek, SeekFrom};
 use std::path::Path;
 
@@ -41,7 +42,7 @@ impl DisassembledScript {
     pub fn from_ysc_file(path: impl AsRef<Path>) -> Result<Self, Error> {
         let src = std::fs::read(path)?;
         let ysc = YSC::new(&src)?.get_script()?;
-        let script = Disassembler::new(&ysc).disassemble()?;
+        let script = Disassembler::new(&ysc).disassemble(None)?;
 
         Ok(script)
     }
@@ -296,23 +297,65 @@ impl<'a> Disassembler<'a> {
             current_stack_top: 0,
         }
     }
-    pub fn disassemble(&mut self) -> Result<DisassembledScript, Error> {
+    pub fn disassemble(&mut self, func_index: Option<usize>) -> Result<DisassembledScript, Error> {
         let mut cursor = Cursor::new(&self.script.code[..]);
         cursor.set_position(0);
 
-        // char* func_2098(var uParam0, var uParam1, int iParam2) // Position - 0x93143
+        let mut current_func_index = 0;
+
         let mut opcodes = Vec::new();
+        let mut function_table = HashMap::<usize, usize>::new();
+
+        let has_func_index = func_index.is_some();
+
+        let mut inst;
+
         while cursor.position() < self.script.code.len() as u64 {
-            let inst = self.disassemble_opcode(&mut cursor)?;
-            opcodes.push(inst);
+            let raw = RawOpcode::try_from(cursor.read_u8()?)?;
+
+            let mut is_enter_opcode = false;
+            if let RawOpcode::Enter = &raw {
+                function_table.insert(
+                    (cursor.position() - 1) as usize, /* remove 1 byte because opcode was read */
+                    current_func_index,
+                );
+
+                if has_func_index && current_func_index > func_index.unwrap() {
+                    break;
+                }
+                is_enter_opcode = true;
+            }
+
+            inst = self.disassemble_opcode(&raw, &mut cursor)?;
+
+            if is_enter_opcode {
+                if let Opcode::Enter { index, .. } = &mut inst {
+                    *index = Some(current_func_index);
+                }
+                current_func_index += 1;
+            }
+
+            if !has_func_index || current_func_index == func_index.unwrap() {
+                opcodes.push(inst);
+            }
+        }
+
+        for opcode in &mut opcodes {
+            if let Opcode::Call { func_index, location } = opcode {
+                let index = function_table.get(&(*location as usize)).map(|val| *val);
+                *func_index = index;
+            }
         }
 
         Ok(DisassembledScript::new(opcodes))
     }
 
-    fn disassemble_opcode(&mut self, cursor: &mut Cursor<&[u8]>) -> Result<Opcode, Error> {
-        let value = RawOpcode::try_from(cursor.read_u8()?)?;
-        match value {
+    fn disassemble_opcode(
+        &mut self,
+        raw_op: &RawOpcode,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<Opcode, Error> {
+        match raw_op {
             RawOpcode::Nop => Ok(Opcode::Nop),
             RawOpcode::Iadd => Ok(Opcode::Iadd),
             RawOpcode::Isub => Ok(Opcode::Isub),
@@ -397,6 +440,7 @@ impl<'a> Disassembler<'a> {
                     arg_count,
                     stack_variables,
                     skip,
+                    index: None,
                 })
             }
             RawOpcode::Leave => Ok(Opcode::Leave {
@@ -531,6 +575,7 @@ impl<'a> Disassembler<'a> {
             }),
             RawOpcode::Call => Ok(Opcode::Call {
                 location: cursor.read_u24::<LittleEndian>()?,
+                func_index: None
             }),
             RawOpcode::LocalU24 => Ok(Opcode::LocalU24 {
                 frame_index: cursor.read_u24::<LittleEndian>()?,
@@ -727,6 +772,7 @@ pub enum Opcode {
         arg_count: u8,
         stack_variables: u16,
         skip: u8,
+        index: Option<usize>,
     },
     Leave {
         arg_count: u8,
@@ -860,6 +906,7 @@ pub enum Opcode {
     },
     Call {
         location: u32,
+        func_index: Option<usize>
     },
     LocalU24 {
         frame_index: u32,
