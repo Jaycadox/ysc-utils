@@ -280,7 +280,7 @@ impl DisassembledOpcode {
             Opcode::LocalU24Load { .. } => "LOCAL_U24_LOAD",
             Opcode::LocalU24Store { .. } => "LOCAL_U24_STORE",
             Opcode::GlobalU24 { .. } => "GLOBAL_U24",
-            Opcode::GlobalU24Load { .. } => "GLOBAL_U24_STORE",
+            Opcode::GlobalU24Load { .. } => "GLOBAL_U24_LOAD",
             Opcode::GlobalU24Store { .. } => "GLOBAL_U24_STORE",
             Opcode::PushConstU24 { .. } => "PUSH_CONST_U24",
             Opcode::Switch { .. } => "SWITCH",
