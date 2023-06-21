@@ -287,7 +287,7 @@ impl DisassembledScript {
 
 pub struct Disassembler<'a> {
     script: &'a YSCScript,
-    current_stack_top: u32,
+    current_stack_top: i64,
 }
 
 impl<'a> Disassembler<'a> {
@@ -341,7 +341,11 @@ impl<'a> Disassembler<'a> {
         }
 
         for opcode in &mut opcodes {
-            if let Opcode::Call { func_index, location } = opcode {
+            if let Opcode::Call {
+                func_index,
+                location,
+            } = opcode
+            {
                 let index = function_table.get(&(*location as usize)).map(|val| *val);
                 *func_index = index;
             }
@@ -394,7 +398,7 @@ impl<'a> Disassembler<'a> {
             RawOpcode::F2I => Ok(Opcode::F2i),
             RawOpcode::F2V => Ok(Opcode::F2v),
             RawOpcode::PushConstU8 => {
-                self.current_stack_top = cursor.read_u8()? as u32;
+                self.current_stack_top = cursor.read_u8()? as i64;
                 Ok(Opcode::PushConstU8 {
                     one: self.current_stack_top as u8,
                 })
@@ -409,9 +413,9 @@ impl<'a> Disassembler<'a> {
                 three: cursor.read_u8()?,
             }),
             RawOpcode::PushConstU32 => {
-                self.current_stack_top = cursor.read_u32::<LittleEndian>()?;
+                self.current_stack_top = cursor.read_u32::<LittleEndian>()? as i64;
                 Ok(Opcode::PushConstU32 {
-                    one: self.current_stack_top,
+                    one: self.current_stack_top as u32,
                 })
             }
             RawOpcode::PushConstF => Ok(Opcode::PushConstF {
@@ -495,9 +499,12 @@ impl<'a> Disassembler<'a> {
             RawOpcode::IoffsetU8Store => Ok(Opcode::IoffsetU8Store {
                 offset: cursor.read_u8()?,
             }),
-            RawOpcode::PushConstS16 => Ok(Opcode::PushConstS16 {
-                num: cursor.read_i16::<LittleEndian>()?,
-            }),
+            RawOpcode::PushConstS16 => {
+                self.current_stack_top = cursor.read_i16::<LittleEndian>()? as i64;
+                Ok(Opcode::PushConstS16 {
+                    num: self.current_stack_top as i16,
+                })
+            }
             RawOpcode::IaddS16 => Ok(Opcode::IaddS16 {
                 num: cursor.read_i16::<LittleEndian>()?,
             }),
@@ -575,7 +582,7 @@ impl<'a> Disassembler<'a> {
             }),
             RawOpcode::Call => Ok(Opcode::Call {
                 location: cursor.read_u24::<LittleEndian>()?,
-                func_index: None
+                func_index: None,
             }),
             RawOpcode::LocalU24 => Ok(Opcode::LocalU24 {
                 frame_index: cursor.read_u24::<LittleEndian>()?,
@@ -596,9 +603,9 @@ impl<'a> Disassembler<'a> {
                 index: cursor.read_u24::<LittleEndian>()?,
             }),
             RawOpcode::PushConstU24 => {
-                self.current_stack_top = cursor.read_u24::<LittleEndian>()?;
+                self.current_stack_top = cursor.read_u24::<LittleEndian>()? as i64;
                 Ok(Opcode::PushConstU24 {
-                    num: self.current_stack_top,
+                    num: self.current_stack_top as u32,
                 })
             }
             RawOpcode::Switch => {
@@ -703,7 +710,7 @@ impl<'a> Disassembler<'a> {
     }
 }
 
-#[derive(Debug, EnumIndex)]
+#[derive(Debug, EnumIndex, Clone)]
 pub enum Opcode {
     Nop,
     Iadd,
@@ -906,7 +913,7 @@ pub enum Opcode {
     },
     Call {
         location: u32,
-        func_index: Option<usize>
+        func_index: Option<usize>,
     },
     LocalU24 {
         frame_index: u32,
@@ -975,7 +982,7 @@ pub enum Opcode {
     IsBitSet,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SwitchEntry {
     index_id: u32,
     jump_offset: u16,

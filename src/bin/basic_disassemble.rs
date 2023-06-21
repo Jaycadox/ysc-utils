@@ -78,9 +78,7 @@ impl DisassembledOpcode {
             Opcode::Call { func_index, .. } if func_index.is_some() => {
                 Some(format!("func_{}", func_index.unwrap()))
             }
-            Opcode::Native { native_hash, .. } => {
-                Some(format!("0x{:0X}", native_hash))
-            }
+            Opcode::Native { native_hash, .. } => Some(format!("0x{:0X}", native_hash)),
             _ => None,
         }
     }

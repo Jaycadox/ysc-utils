@@ -33,6 +33,10 @@ path = "src/bin/strings.rs"
 name = "native_table"
 path = "src/bin/native_table.rs"
 
+[[bin]]
+name = "ast_gen"
+path = "src/bin/ast_gen.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
