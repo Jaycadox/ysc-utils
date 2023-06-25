@@ -1,6 +1,6 @@
 use crate::disassemble::{DisassembledScript, GlobalReference};
 use anyhow::{Context, Error, Result};
-use onig::*;
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -15,7 +15,7 @@ fn extract_numbers(input: &str) -> Vec<u32> {
 
     for capture in re.captures_iter(&input) {
         for number in capture.iter().flatten() {
-            if let Ok(num) = number.to_string().parse() {
+            if let Ok(num) = number.as_str().to_string().parse() {
                 numbers.push(num);
             }
         }
