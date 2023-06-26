@@ -346,7 +346,7 @@ impl<'a> Disassembler<'a> {
                 location,
             } = opcode
             {
-                let index = function_table.get(&(*location as usize)).map(|val| *val);
+                let index = function_table.get(&(*location as usize)).copied();
                 *func_index = index;
             }
         }
