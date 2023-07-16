@@ -266,24 +266,24 @@ impl Display for AstFunction {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let local_vars = if self.local_vars == 0 && self.temp_vars == 0 {
+        let local_vars = if self.vars.local == 0 && self.vars.temp == 0 {
             "".to_owned()
         } else {
             let mut vars_str = "".to_owned();
-            if self.local_vars != 0 {
+            if self.vars.local != 0 {
                 let local_vars = format!(
                     "\n\tvar {};",
-                    (0..self.local_vars)
+                    (0..self.vars.local)
                         .map(|x| format!("local{x}"))
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
                 vars_str.push_str(&local_vars);
             }
-            if self.temp_vars != 0 {
+            if self.vars.temp != 0 {
                 let temp_vars = format!(
                     "\n\tvar {};\n",
-                    (0..self.temp_vars)
+                    (0..self.vars.temp)
                         .map(|x| format!("temp_{x}"))
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -512,8 +512,7 @@ pub struct AstFunction {
     num_args: u8,
     num_returns: u8,
     index: usize,
-    local_vars: u8,
-    temp_vars: u8,
+    vars: Vars
 }
 
 #[derive(Clone)]
@@ -616,6 +615,12 @@ impl AstStack {
     }
 }
 
+#[derive(Default, Debug, Clone)]
+struct Vars {
+    local: u8,
+    temp: u8
+}
+
 pub struct AstGenerator {
     functions: Arc<Vec<Function>>,
     lifted_functions: Arc<Mutex<HashMap<usize, Arc<AstFunction>>>>,
@@ -661,17 +666,12 @@ impl AstGenerator {
     ) -> Result<AstFunction, Error> {
         self.active_functions.lock().unwrap().insert(function.index);
 
-        let has_dup_conditional = function.instructions[1..]
-            .iter()
-            .any(|i| matches!(i, Opcode::Dup));
-        let (body, num_returns, local_vars, temp_vars) = match self.generate_ast(
+        let (body, num_returns, vars) = match self.generate_ast(
             &function.instructions[1..],
             function.index,
             stack,
             depth,
-            &mut 0,
-            &mut 0,
-            has_dup_conditional,
+            &mut Vars::default()
         ) {
             Ok(res) => {
                 self.active_functions
@@ -694,8 +694,7 @@ impl AstGenerator {
             num_args: function.num_args,
             num_returns,
             index: function.index,
-            local_vars,
-            temp_vars,
+            vars
         };
 
         Ok(ast_func)
@@ -705,7 +704,6 @@ impl AstGenerator {
         index: &'a mut usize,
         mut offset_remaining: i16,
         instructions: &'b [Opcode],
-        has_dup_conditional: bool,
     ) -> Option<&'b [Opcode]> {
         *index += 1;
         let og_index = *index;
@@ -778,9 +776,7 @@ impl AstGenerator {
         function_index: usize,
         stack: &mut AstStack,
         depth: usize,
-        local_vars: &mut u8,
-        temp_vars: &mut u8,
-        has_dup_conditional: bool,
+        vars: &mut Vars
     ) -> Result<()> {
         if offset_remaining == 0 {
             return Ok(());
@@ -790,7 +786,6 @@ impl AstGenerator {
             index,
             offset_remaining,
             instructions,
-            has_dup_conditional,
         )
         .context("Invalid block size: {}")?;
         let mut is_while = false;
@@ -805,7 +800,6 @@ impl AstGenerator {
                         index,
                         offset,
                         instructions,
-                        has_dup_conditional,
                     )
                     .ok_or(anyhow!("Invalid block size"))?;
 
@@ -815,9 +809,7 @@ impl AstGenerator {
                             function_index,
                             stack,
                             depth,
-                            local_vars,
-                            temp_vars,
-                            has_dup_conditional,
+                            vars
                         )?
                         .0,
                     ))
@@ -844,9 +836,7 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?
                     .0,
                 ),
@@ -860,9 +850,7 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?
                     .0,
                 ),
@@ -879,10 +867,8 @@ impl AstGenerator {
         function_index: usize,
         stack: &mut AstStack,
         mut depth: usize,
-        local_vars: &mut u8,
-        temp_vars: &mut u8,
-        mut has_dup_conditional: bool,
-    ) -> Result<(Ast, u8, u8, u8), Error> {
+        vars: &mut Vars
+    ) -> Result<(Ast, u8, Vars), Error> {
         let mut index = 0;
         let mut statements = Vec::with_capacity(8);
         let mut returns = 0;
@@ -904,7 +890,6 @@ impl AstGenerator {
             //     println!("STACK_TOP: {}", stack.stack.last().unwrap());
             // }
             // println!("ITER:\n{list}\n\n");
-            // println!("HAS DUP: {}", has_dup_conditional);
 
             match inst {
                 Opcode::PushConstM1 => {
@@ -981,7 +966,7 @@ impl AstGenerator {
                 }
                 Opcode::Nop => {}
                 Opcode::Ilt => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntLessThan {
                         lhs: Box::new(lhs),
@@ -989,7 +974,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Ile => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntLessThanOrEq {
                         lhs: Box::new(lhs),
@@ -997,7 +982,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Igt => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntGreaterThan {
                         lhs: Box::new(lhs),
@@ -1005,7 +990,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Ige => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntGreaterThanOrEq {
                         lhs: Box::new(lhs),
@@ -1013,7 +998,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Flt => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatLessThan {
                         lhs: Box::new(lhs),
@@ -1021,7 +1006,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Fgt => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatGreaterThan {
                         lhs: Box::new(lhs),
@@ -1029,7 +1014,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Fle => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatLessThanOrEq {
                         lhs: Box::new(lhs),
@@ -1037,7 +1022,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Fge => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatGreaterThanOrEq {
                         lhs: Box::new(lhs),
@@ -1045,7 +1030,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Ior => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
 
                     stack.push(Ast::IntegerOr {
@@ -1054,7 +1039,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Iand => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntegerAnd {
                         lhs: Box::new(lhs),
@@ -1062,7 +1047,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Iadd => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntAdd {
                         lhs: Box::new(lhs),
@@ -1070,7 +1055,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Imul => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntMul {
                         lhs: Box::new(lhs),
@@ -1078,7 +1063,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::ImulU8 { num } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 1)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 1)?;
                     let lhs = args.pop().ok_or(err())?;
                     stack.push(Ast::IntMul {
                         lhs: Box::new(lhs),
@@ -1086,7 +1071,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::ImulS16 { num } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 1)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 1)?;
                     let lhs = args.pop().ok_or(err())?;
                     stack.push(Ast::IntMul {
                         lhs: Box::new(lhs),
@@ -1094,7 +1079,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Fmul => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatMul {
                         lhs: Box::new(lhs),
@@ -1103,7 +1088,7 @@ impl AstGenerator {
                 }
                 Opcode::IaddS16 { num } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     stack.push(Ast::IntAdd {
@@ -1113,7 +1098,7 @@ impl AstGenerator {
                 }
                 Opcode::IaddU8 { num } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     stack.push(Ast::IntAdd {
@@ -1122,7 +1107,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Isub => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntSub {
                         lhs: Box::new(lhs),
@@ -1130,7 +1115,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Fsub => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatSub {
                         lhs: Box::new(lhs),
@@ -1138,7 +1123,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Idiv => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntDiv {
                         lhs: Box::new(lhs),
@@ -1146,7 +1131,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Imod => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntMod {
                         lhs: Box::new(lhs),
@@ -1154,7 +1139,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Fdiv => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatDiv {
                         lhs: Box::new(lhs),
@@ -1162,7 +1147,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::Fadd => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::FloatAdd {
                         lhs: Box::new(lhs),
@@ -1189,7 +1174,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::ArrayU8 { size } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
@@ -1204,7 +1189,7 @@ impl AstGenerator {
                     })
                 }
                 Opcode::ArrayU8Load { size } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
@@ -1217,7 +1202,7 @@ impl AstGenerator {
                     })
                 }
                 Opcode::ArrayU16 { size } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
@@ -1232,7 +1217,7 @@ impl AstGenerator {
                     })
                 }
                 Opcode::ArrayU16Load { size } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
@@ -1246,7 +1231,7 @@ impl AstGenerator {
                 }
 
                 Opcode::LocalU8 { frame_index } => {
-                    self.register_local_var(function_index, *frame_index, local_vars);
+                    self.register_local_var(function_index, *frame_index, &mut vars.local);
                     let num_args = self.functions[function_index].num_args;
 
                     let local_var_index = if *frame_index > num_args {
@@ -1262,7 +1247,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::LocalU8Load { frame_index } => {
-                    self.register_local_var(function_index, *frame_index, local_vars);
+                    self.register_local_var(function_index, *frame_index, &mut vars.local);
                     let num_args = self.functions[function_index].num_args;
 
                     let local_var_index = if *frame_index > num_args {
@@ -1277,7 +1262,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::LocalU8Store { frame_index } => {
-                    self.register_local_var(function_index, *frame_index, local_vars);
+                    self.register_local_var(function_index, *frame_index, &mut vars.local);
                     let num_args = self.functions[function_index].num_args;
 
                     let local_var_index = if *frame_index > num_args {
@@ -1286,7 +1271,7 @@ impl AstGenerator {
                         None
                     };
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
@@ -1300,7 +1285,7 @@ impl AstGenerator {
                 }
                 Opcode::GlobalU24Store { index } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     statements.push(Ast::Store {
@@ -1310,7 +1295,7 @@ impl AstGenerator {
                 }
                 Opcode::GlobalU16Store { index } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     statements.push(Ast::Store {
@@ -1329,7 +1314,7 @@ impl AstGenerator {
                     stack.push(Ast::Global { index: *index });
                 }
                 Opcode::IoffsetU8Store { offset } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let rhs = args.pop().ok_or(err())?;
                     let var = args.pop().ok_or(err())?;
 
@@ -1343,7 +1328,7 @@ impl AstGenerator {
                 }
                 Opcode::IoffsetS16 { offset } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
@@ -1356,7 +1341,7 @@ impl AstGenerator {
                 }
                 Opcode::IoffsetU8 { offset } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
@@ -1369,7 +1354,7 @@ impl AstGenerator {
                 }
                 Opcode::IoffsetU8Load { offset } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
@@ -1385,7 +1370,7 @@ impl AstGenerator {
                 }
                 Opcode::IoffsetS16Load { offset } => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
@@ -1395,7 +1380,7 @@ impl AstGenerator {
                     });
                 }
                 Opcode::IoffsetS16Store { offset } => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let rhs = args.pop().ok_or(err())?;
                     let var = args.pop().ok_or(err())?;
 
@@ -1412,7 +1397,7 @@ impl AstGenerator {
                         statements.push(Ast::Return { var: None });
                     } else {
                         let len = stack.len();
-                        let mut items = stack.pop(&mut statements, temp_vars, len as u32)?;
+                        let mut items = stack.pop(&mut statements, &mut vars.temp, len as u32)?;
 
                         if items.len() == 1 {
                             statements.push(Ast::Return {
@@ -1428,7 +1413,7 @@ impl AstGenerator {
                     break;
                 }
                 Opcode::IsBitSet => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (bit, val) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IsBitSet {
                         val: Box::new(val),
@@ -1441,7 +1426,7 @@ impl AstGenerator {
                     num_returns,
                     ..
                 } => {
-                    let mut args_list = stack.pop(&mut statements, temp_vars, *num_args as u32)?;
+                    let mut args_list = stack.pop(&mut statements, &mut vars.temp, *num_args as u32)?;
                     args_list.reverse();
                     let native = Ast::Native {
                         num_returns: *num_returns,
@@ -1461,7 +1446,7 @@ impl AstGenerator {
                         return Err(anyhow!("Function recursively calls itself"));
                     }
                     let num_args = self.functions[index].num_args;
-                    let mut args_list = stack.pop(&mut statements, temp_vars, num_args as u32)?;
+                    let mut args_list = stack.pop(&mut statements, &mut vars.temp, num_args as u32)?;
                     args_list.reverse();
                     depth += 1;
                     let mut new_stack = AstStack::new();
@@ -1492,19 +1477,17 @@ impl AstGenerator {
                 }
                 Opcode::Drop => {
                     let ast = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     if ast.get_stack_size() == 1 {
                         // very janky way of detecting if this is a statement or a temporary value
-                        if format!("{ast}").ends_with(";") {
+                        if format!("{ast}").ends_with(';') {
                             statements.push(ast);
                         }
                     }
                 }
                 Opcode::Dup => {
-                    has_dup_conditional = true;
-
                     // Fixes Rockstar's jank conditionals
                     if instructions.len() - index > 2 {
                         if matches!(instructions[index + 1], Opcode::Inot) {
@@ -1518,7 +1501,7 @@ impl AstGenerator {
                         }
                     } else {
                         let ast = stack
-                            .pop(&mut statements, temp_vars, 1)?
+                            .pop(&mut statements, &mut vars.temp, 1)?
                             .pop()
                             .ok_or(err())?;
                         stack.push(ast.clone());
@@ -1526,7 +1509,7 @@ impl AstGenerator {
                     }
                 }
                 Opcode::Ine => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntegerNotEqual {
                         lhs: Box::new(lhs),
@@ -1534,7 +1517,7 @@ impl AstGenerator {
                     })
                 }
                 Opcode::Ieq => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntegerEqual {
                         lhs: Box::new(lhs),
@@ -1543,7 +1526,7 @@ impl AstGenerator {
                 }
                 Opcode::String { value, .. } => {
                     let string_index = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     stack.push(Ast::String {
@@ -1552,7 +1535,7 @@ impl AstGenerator {
                     })
                 }
                 Opcode::LoadN => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (size, address) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let size = if let Ast::ConstInt { val } = size {
                         val
@@ -1566,7 +1549,7 @@ impl AstGenerator {
                     })
                 }
                 Opcode::StoreN => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (size, lhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let size = if let Ast::ConstInt { val } = size {
                         val
@@ -1574,7 +1557,7 @@ impl AstGenerator {
                         return Err(anyhow!("StoreN called with non-const size."));
                     };
 
-                    let mut stack_items = stack.pop(&mut statements, temp_vars, size as u32)?;
+                    let mut stack_items = stack.pop(&mut statements, &mut vars.temp, size as u32)?;
                     if stack_items.len() == 1 {
                         statements.push(Ast::Memcpy {
                             lhs: Box::new(lhs),
@@ -1596,7 +1579,7 @@ impl AstGenerator {
                     }
                 }
                 Opcode::Store => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (rhs, lhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let lhs = Ast::Dereference { val: Box::new(lhs) };
 
@@ -1606,7 +1589,7 @@ impl AstGenerator {
                     })
                 }
                 Opcode::StoreRev => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let lhs = Ast::Dereference { val: Box::new(lhs) };
                     stack.push(lhs.clone());
@@ -1617,26 +1600,26 @@ impl AstGenerator {
                 }
                 Opcode::Inot => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     stack.push(Ast::Not { val: Box::new(arg) });
                 }
                 Opcode::Load => {
                     let arg = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     stack.push(Ast::Dereference { val: Box::new(arg) });
                 }
                 Opcode::J { offset } if *offset == 0 => {}
                 Opcode::Jz { offset } if *offset >= 0 => {
-                    let condition = stack
-                        .pop(&mut statements, temp_vars, 1)?
+                    let condition = Box::new(stack
+                        .pop(&mut statements, &mut vars.temp, 1)?
                         .pop()
-                        .ok_or(err())?;
+                        .ok_or(err())?);
                     self.generate_if(
-                        Box::new(condition),
+                        condition,
                         *offset,
                         &mut index,
                         instructions,
@@ -1644,13 +1627,11 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?;
                 }
                 Opcode::IEqJz { offset } if *offset >= 0 => {
-                    let mut args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let mut args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let condition = Box::new(Ast::IntegerEqual {
                         lhs: Box::new(lhs),
@@ -1665,13 +1646,11 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?;
                 }
                 Opcode::INeJz { offset } if *offset >= 0 => {
-                    let args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let condition = Box::new(Ast::IntegerNotEqual {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
@@ -1685,13 +1664,11 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?;
                 }
                 Opcode::IGtJz { offset } if *offset >= 0 => {
-                    let args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let condition = Box::new(Ast::IntGreaterThan {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
@@ -1705,13 +1682,11 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?;
                 }
                 Opcode::ILtJz { offset } if *offset >= 0 => {
-                    let args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let condition = Box::new(Ast::IntLessThan {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
@@ -1725,13 +1700,11 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?;
                 }
                 Opcode::ILeJz { offset } if *offset >= 0 => {
-                    let args = stack.pop(&mut statements, temp_vars, 2)?;
+                    let args = stack.pop(&mut statements, &mut vars.temp, 2)?;
                     let condition = Box::new(Ast::IntLessThanOrEq {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
@@ -1745,9 +1718,7 @@ impl AstGenerator {
                         function_index,
                         stack,
                         depth,
-                        local_vars,
-                        temp_vars,
-                        has_dup_conditional,
+                        vars
                     )?;
                 }
                 _ => {
@@ -1764,8 +1735,7 @@ impl AstGenerator {
                 stack_size: stack.len(),
             },
             returns,
-            *local_vars,
-            *temp_vars,
+            vars.clone()
         ))
     }
 
