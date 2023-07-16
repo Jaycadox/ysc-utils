@@ -41,8 +41,9 @@ path = "src/bin/ast_gen.rs"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
-strip = "symbols"
+#panic = "abort"
+#strip = "symbols"
+debug = true
 
 [dependencies]
 bitbuffer = "0.10.9"
@@ -57,4 +58,3 @@ tinyfiledialogs = "3.9.1"
 serde = "1.0.164"
 serde_json = "1.0.97"
 serde_derive = "1.0.164"
-rayon = "1.7.0"
