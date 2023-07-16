@@ -983,6 +983,19 @@ pub enum Opcode {
 }
 
 impl Opcode {
+    pub fn is_jump(&self) -> Option<i16> {
+        return match &self {
+            Opcode::Jz { offset } => Some(*offset),
+            Opcode::ILtJz { offset } => Some(*offset),
+            Opcode::ILeJz { offset } => Some(*offset),
+            Opcode::INeJz { offset } => Some(*offset),
+            Opcode::IEqJz { offset } => Some(*offset),
+            Opcode::IGtJz { offset } => Some(*offset),
+            Opcode::IGeJz { offset } => Some(*offset),
+            Opcode::J { offset } => Some(*offset),
+            _ => None
+        }
+    }
     pub fn get_size(&self) -> usize {
         match &self {
             Opcode::Nop => 1,
