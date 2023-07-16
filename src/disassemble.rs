@@ -993,8 +993,8 @@ impl Opcode {
             Opcode::IGtJz { offset } => Some(*offset),
             Opcode::IGeJz { offset } => Some(*offset),
             Opcode::J { offset } => Some(*offset),
-            _ => None
-        }
+            _ => None,
+        };
     }
     pub fn get_size(&self) -> usize {
         match &self {

@@ -661,7 +661,9 @@ impl AstGenerator {
     ) -> Result<AstFunction, Error> {
         self.active_functions.lock().unwrap().insert(function.index);
 
-        let has_dup_conditional = function.instructions[1..].iter().any(|i| matches!(i, Opcode::Dup));
+        let has_dup_conditional = function.instructions[1..]
+            .iter()
+            .any(|i| matches!(i, Opcode::Dup));
         let (body, num_returns, local_vars, temp_vars) = match self.generate_ast(
             &function.instructions[1..],
             function.index,
@@ -707,8 +709,12 @@ impl AstGenerator {
     ) -> Option<&'b [Opcode]> {
         *index += 1;
         let og_index = *index;
-        
-        fn find_offset<'a, 'b>(mut offset_remaining: i16, instructions: &'b [Opcode], mut index: usize) -> Option<usize> {
+
+        fn find_offset<'a, 'b>(
+            mut offset_remaining: i16,
+            instructions: &'b [Opcode],
+            mut index: usize,
+        ) -> Option<usize> {
             while offset_remaining > 0 {
                 if instructions.len() == index {
                     return None;
@@ -742,7 +748,7 @@ impl AstGenerator {
                     }
                     _ => {}
                 }
-                
+
                 if offset_remaining != 0 {
                     index += 1;
                 }
@@ -1000,7 +1006,7 @@ impl AstGenerator {
                 }
                 Opcode::Ige => {
                     let mut args = stack.pop(&mut statements, temp_vars, 2)?;
-                    let (lhs, rhs)= (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
+                    let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     stack.push(Ast::IntGreaterThanOrEq {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
@@ -1498,21 +1504,19 @@ impl AstGenerator {
                 }
                 Opcode::Dup => {
                     has_dup_conditional = true;
-                    
-                    // Fixes Rockstar's jank conditionals 
+
+                    // Fixes Rockstar's jank conditionals
                     if instructions.len() - index > 2 {
                         if matches!(instructions[index + 1], Opcode::Inot) {
                             if matches!(instructions[index + 2], Opcode::Jz { .. }) {
                                 index += 2;
                             }
                         }
-                        
+
                         if matches!(instructions[index + 1], Opcode::Jz { .. }) {
                             index += 1;
                         }
-                        
                     } else {
-                        println!("real dup");
                         let ast = stack
                             .pop(&mut statements, temp_vars, 1)?
                             .pop()
@@ -1520,7 +1524,6 @@ impl AstGenerator {
                         stack.push(ast.clone());
                         stack.push(ast);
                     }
-                    
                 }
                 Opcode::Ine => {
                     let mut args = stack.pop(&mut statements, temp_vars, 2)?;
@@ -1809,8 +1812,6 @@ impl AstGenerator {
         functions
     }
 }
-
-
 
 impl TryFrom<YSCScript> for AstGenerator {
     type Error = Error;
