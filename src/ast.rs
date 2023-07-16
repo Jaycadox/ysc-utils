@@ -729,19 +729,7 @@ impl AstGenerator {
 
         let instructions_in_block;
         if *index < instructions.len() {
-            if has_dup_conditional {
-                println!("dup conditional: would take this block for ~{}, now taking ~{}", *index-og_index, instructions.len() - og_index);
-                let mut new_index = *index;
-                for inst in &instructions[og_index..] {
-                    new_index += 1;
-                    if matches!(inst, Opcode::Leave { .. }) {
-                        break;
-                    }
-                }
-                instructions_in_block = &instructions[og_index..];
-            } else {
-                instructions_in_block = &instructions[og_index..=*index];
-            }
+            instructions_in_block = &instructions[og_index..=*index];
         } else {
             return None;
         }
@@ -834,7 +822,7 @@ impl AstGenerator {
             }
         } else {
             Ast::If {
-                condition: condition,
+                condition,
                 body: Box::new(
                     self.generate_ast(
                         instructions_in_block,
@@ -872,20 +860,20 @@ impl AstGenerator {
             anyhow!("Invalid stack item")
         }
 
-        'outer: while index < instructions.len() {
+        while index < instructions.len() {
             let inst = &instructions[index];
 
-            let list = Ast::StatementList {
-                list: statements.clone(),
-                stack_size: 0,
-            };
-            println!("INST: {inst:?} func_{function_index}");
-            println!("STACK: {:?} / {}", stack.stack, stack.len());
-            if stack.len() != 0 {
-                println!("STACK_TOP: {}", stack.stack.last().unwrap());
-            }
-            println!("ITER:\n{list}\n\n");
-            println!("HAS DUP: {}", has_dup_conditional);
+            // let list = Ast::StatementList {
+            //     list: statements.clone(),
+            //     stack_size: 0,
+            // };
+            // println!("INST: {inst:?} func_{function_index}");
+            // println!("STACK: {:?} / {}", stack.stack, stack.len());
+            // if stack.len() != 0 {
+            //     println!("STACK_TOP: {}", stack.stack.last().unwrap());
+            // }
+            // println!("ITER:\n{list}\n\n");
+            // println!("HAS DUP: {}", has_dup_conditional);
 
             match inst {
                 Opcode::PushConstM1 => {
@@ -1478,30 +1466,28 @@ impl AstGenerator {
                 }
                 Opcode::Dup => {
                     has_dup_conditional = true;
-                    //let mut offset = 0;
-                    //loop {
-                    //    offset += 1;
-                    //    if matches!(instructions[index + offset], Opcode::Nop) {
-                    //        continue;
-                    //    }
-                    //    if matches!(instructions[index + offset], Opcode::Jz { .. }) {
-                    //        index += offset + 2;
-                    //        continue 'outer;
-                    //    }
-//
-                    //    if matches!(instructions[index + offset], Opcode::Inot) {
-                    //        continue;
-                    //    }
-//
-                    //    break;
-                    //}
-
-                    let ast = stack
+                    
+                    // Fixes Rockstar's jank conditionals 
+                    if instructions.len() - index > 2 {
+                        if matches!(instructions[index + 1], Opcode::Inot) {
+                            if matches!(instructions[index + 2], Opcode::Jz { .. }) {
+                                index += 2;
+                            }
+                        }
+                        
+                        if matches!(instructions[index + 1], Opcode::Jz { .. }) {
+                            index += 1;
+                        }
+                        
+                    } else {
+                        let ast = stack
                         .pop(&mut statements, temp_vars, 1)?
                         .pop()
                         .ok_or(err())?;
-                    stack.push(ast.clone());
-                    stack.push(ast);
+                        stack.push(ast.clone());
+                        stack.push(ast);
+                    }
+                    
                 }
                 Opcode::Ine => {
                     let mut args = stack.pop(&mut statements, temp_vars, 2)?;
