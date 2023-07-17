@@ -1,4 +1,3 @@
-use anyhow::Context;
 use ysc_utils::{ast::AstGenerator, ysc::YSCScript};
 
 fn main() {
@@ -19,7 +18,6 @@ fn main() {
     };
 
     let script = YSCScript::from_ysc_file(&args.pop().expect("No script file in input"))
-        .context("Failed to read/parse/disassemble ysc file")
         .unwrap();
 
     let ast_gen = AstGenerator::try_from(script).unwrap();
@@ -42,7 +40,6 @@ fn main() {
                 funcs.iter().for_each(|i| {
                     if let Ok(_func) = ast_gen.generate_function(*i) {
                         num_pass += 1;
-                    } else {
                     }
                 });
             }

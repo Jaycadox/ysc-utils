@@ -1,52 +1,86 @@
-use anyhow::Error;
-use anyhow::Result;
-use bitbuffer::{BitReadBuffer, BitReadStream, LittleEndian};
+use bitbuffer::{BitReadBuffer, BitReadStream, LittleEndian, BitError};
 use std::collections::HashMap;
 use std::path::Path;
+use thiserror::Error;
 
+/// Errors pertaining to reading YSC files
+#[derive(Error, Debug)]
+pub enum YscError {
+    /// Generic deserialization error, most likely invalid format
+    #[error("error while reading script file")]
+    InvalidOpcodeFormat(#[from] BitError),
+
+    /// Generic io error (ex: file not found)
+    #[error("io error")]
+    IoError(#[from] std::io::Error),
+}
+
+/// YSC header information
 #[derive(Default, Debug)]
 pub struct YSCHeader {
+    /// Not entirely sure
     pub page_base: i32,
+    /// Not entirely sure
     pub page_map_ptr: i32,
+    /// Start of code blocks
     pub code_block_base_ptr: i32,
+    /// Some sort of information pertaining to the version/signature of globals
     pub globals_signature: i32,
+    /// Total length of the code
     pub code_size: i32,
+    /// Number of parameters for the script
     pub parameter_count: i32,
+    /// Number of static/script local variabes
     pub static_count: i32,
+    /// Number of script global variables
     pub global_count: i32,
+    /// Number of natives at natives_ptr
     pub natives_count: i32,
+    /// Location of static variables
     pub statics_ptr: i32,
+    /// Location of global variables
     pub globals_ptr: i32,
+    /// Location of natives
     pub natives_ptr: i32,
+    /// unk
     pub unk_1: i32,
+    /// unk
     pub unk_2: i32,
+    /// JOAAT hash of the scriot name
     pub script_name_hash: i32,
+    /// unk
     pub unk_3: i32,
+    /// Location of the script name
     pub script_name_ptr: i32,
+    /// Location of the string table
     pub string_blocks_base_ptr: i32,
+    /// Total size of strin table
     pub string_size: i32,
+    /// unk
     pub unk_4: i32,
+    /// unk
     pub unk_5: i32,
+    /// unk
     pub unk_6: i32,
 }
 
 impl YSCHeader {
-    fn new(stream: &mut BitReadStream<'_, LittleEndian>) -> Result<Self, Error> {
+    fn new(stream: &mut BitReadStream<'_, LittleEndian>) -> Result<Self, YscError> {
         stream.set_pos(0)?;
         let mut header = YSCHeader::default();
 
-        let read_int = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
+        let read_int = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, YscError> {
             let res = stream.read_int::<i32>(32)?;
             Ok(res)
         };
 
-        let read_int_large = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
+        let read_int_large = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, YscError> {
             let res = stream.read_int::<i32>(32)?;
             stream.skip_bits(32)?;
             Ok(res)
         };
 
-        let read_ptr = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, Error> {
+        let read_ptr = |stream: &mut BitReadStream<'_, LittleEndian>| -> Result<i32, YscError> {
             let res = stream.read_int::<i32>(32)? & 0xFFFFFF;
             stream.skip_bits(32)?;
             Ok(res)
@@ -77,30 +111,43 @@ impl YSCHeader {
     }
 }
 
+/// On-demand information about a YSC file
 #[derive(Debug)]
-pub struct YSC<'a> {
+pub struct YSCReader<'a> {
     stream: BitReadStream<'a, LittleEndian>,
+    /// Script header
     pub header: YSCHeader,
 }
 
+/// YSC script with data gathered in a useful and structured way
 #[derive(Debug)]
 pub struct YSCScript {
+    /// Plaintext name of script
     pub name: String,
+    /// Vec of native hashes
     pub native_table: Vec<u64>,
+    /// Vec of string table offsets
     pub string_table_offsets: Vec<u64>,
+    /// Vec of code table offsets
     pub code_table_offsets: Vec<u64>,
+    /// HashMap with the string's location and value
     pub strings: HashMap<usize, String>,
+    /// Large Vec of the entire string table as bytes
+    /// Used for if a String instruction indexes into the middle of a string
     pub string_table: Vec<u8>,
+    /// Vec of the code bytes of the script
     pub code: Vec<u8>,
 }
 
 impl YSCScript {
-    pub fn from_ysc_file(path: impl AsRef<Path>) -> Result<Self, Error> {
+    /// Create a YSCSCript from a path
+    pub fn from_ysc_file(path: impl AsRef<Path>) -> Result<Self, YscError> {
         let src = std::fs::read(path)?;
-        let ysc = YSC::new(&src)?.get_script()?;
+        let ysc = YSCReader::new(&src)?.get_script()?;
         Ok(ysc)
     }
 
+    /// Attempt to get a string from a certain index, this allows you to index into the middle of strings
     pub fn get_string_with_index(&self, index: usize) -> Option<String> {
         let table = &self.string_table;
         let mut i = index;
@@ -134,15 +181,24 @@ impl YSCScript {
     }
 }
 
-impl<'a> YSC<'a> {
-    pub fn new(data: &'a [u8]) -> Result<Self, Error> {
+impl<'a> TryFrom<YSCReader<'a>> for YSCScript {
+    type Error = YscError;
+    fn try_from(mut value: YSCReader<'a>) -> Result<Self, Self::Error> {
+        value.get_script()
+    }
+}
+
+impl<'a> YSCReader<'a> {
+    /// Create a YSCReader given the bytes to the YSC file
+    pub fn new(data: &'a [u8]) -> Result<Self, YscError> {
         let buffer = BitReadBuffer::new(data, LittleEndian);
         let mut stream = BitReadStream::new(buffer);
         let header = YSCHeader::new(&mut stream)?;
-        Ok(YSC { stream, header })
+        Ok(YSCReader { stream, header })
     }
 
-    pub fn get_script(&mut self) -> Result<YSCScript, Error> {
+    /// Create a YSCSCript from a YSCReader
+    pub fn get_script(&mut self) -> Result<YSCScript, YscError> {
         let string_table = self.get_string_table()?;
         Ok(YSCScript {
             name: self.get_script_name()?,
@@ -155,25 +211,28 @@ impl<'a> YSC<'a> {
         })
     }
 
-    pub fn get_script_name(&mut self) -> Result<String, Error> {
+    /// Read current script name
+    pub fn get_script_name(&mut self) -> Result<String, YscError> {
         self.stream
             .set_pos(self.header.script_name_ptr as usize * 8)?;
 
         Ok(self.stream.read_string(None)?.to_string())
     }
 
-    pub fn get_native_table(&mut self) -> Result<Vec<u64>, Error> {
+    /// Read native table
+    pub fn get_native_table(&mut self) -> Result<Vec<u64>, YscError> {
         self.stream.set_pos(self.header.natives_ptr as usize * 8)?;
         let mut natives = vec![];
         for i in 0..self.header.natives_count {
             let encrypted_hash: u64 = self.stream.read_int(64)?;
-            let hash = YSC::native_hash_rotate(encrypted_hash, (self.header.code_size + i) as u32);
+            let hash = YSCReader::native_hash_rotate(encrypted_hash, (self.header.code_size + i) as u32);
             natives.push(hash);
         }
         Ok(natives)
     }
 
-    pub fn get_string_table_offsets(&mut self) -> Result<Vec<u64>, Error> {
+    /// Read string table offsets
+    pub fn get_string_table_offsets(&mut self) -> Result<Vec<u64>, YscError> {
         self.stream
             .set_pos((self.header.string_blocks_base_ptr * 8) as usize)?;
         let string_block_count = (self.header.string_size + 0x3FFF).overflowing_shr(14).0;
@@ -186,7 +245,8 @@ impl<'a> YSC<'a> {
         Ok(string_tables)
     }
 
-    pub fn get_code(&mut self) -> Result<Vec<u8>, Error> {
+    /// Read code
+    pub fn get_code(&mut self) -> Result<Vec<u8>, YscError> {
         let mut code = Vec::new();
         let code_table_offsets = self.get_code_table_offsets()?;
 
@@ -206,7 +266,8 @@ impl<'a> YSC<'a> {
         Ok(code)
     }
 
-    pub fn get_string_table(&mut self) -> Result<Vec<u8>, Error> {
+    /// Read entire string table
+    pub fn get_string_table(&mut self) -> Result<Vec<u8>, YscError> {
         let string_block_count = (self.header.string_size + 0x3FFF).overflowing_shr(14).0;
         let string_table_offsets = self.get_string_table_offsets()?;
         let mut table: Vec<u8> = vec![0; self.header.string_size as usize];
@@ -231,7 +292,8 @@ impl<'a> YSC<'a> {
         Ok(table)
     }
 
-    pub fn get_strings(&mut self, table: &Vec<u8>) -> Result<HashMap<usize, String>, Error> {
+    /// Read strings and get their location
+    pub fn get_strings(&mut self, table: &Vec<u8>) -> Result<HashMap<usize, String>, YscError> {
         let mut strings = HashMap::new();
         let mut string_buf: Vec<u8> = Vec::with_capacity(100);
 
@@ -265,7 +327,8 @@ impl<'a> YSC<'a> {
         Ok(strings)
     }
 
-    pub fn get_code_table_offsets(&mut self) -> Result<Vec<u64>, Error> {
+    /// Read offsets to code table blocks
+    pub fn get_code_table_offsets(&mut self) -> Result<Vec<u64>, YscError> {
         self.stream
             .set_pos((self.header.code_block_base_ptr * 8) as usize)?;
         let code_block_count = (self.header.code_size + 0x3FFF).overflowing_shr(14).0;

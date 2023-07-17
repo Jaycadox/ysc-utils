@@ -1,4 +1,4 @@
-use anyhow::{Context, Error, Result};
+use anyhow::{Error, Result};
 use ysc_utils::ysc::YSCScript;
 
 fn main() {
@@ -14,8 +14,9 @@ fn start() -> Result<(), Error> {
         println!("Usage: native_table %ysc_script%");
         return Ok(());
     }
+    
     let script =
-        YSCScript::from_ysc_file(&args[0]).context("Failed to read/parse/disassemble ysc file")?;
+        YSCScript::from_ysc_file(&args[0])?;
 
     for hash in script.native_table {
         println!("{hash:016X}");

@@ -1,4 +1,4 @@
-use anyhow::{Context, Error, Result};
+use anyhow::{Error, Result};
 use ysc_utils::ysc::*;
 
 fn main() {
@@ -19,7 +19,7 @@ fn run() -> Result<(), Error> {
         return Ok(());
     }
 
-    let ysc = YSCScript::from_ysc_file(&args[0]).context("Failed to read or parse ysc file")?;
+    let ysc = YSCScript::from_ysc_file(&args[0])?;
 
     println!("Script name: {}", ysc.name);
     println!("String table size: {}", ysc.strings.len());

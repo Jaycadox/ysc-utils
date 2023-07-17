@@ -1,5 +1,5 @@
 use crate::ysc::*;
-use anyhow::{Error, Result};
+use thiserror::Error;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use enum_index::*;
 use enum_index_derive::*;
@@ -9,17 +9,36 @@ use std::collections::HashMap;
 use std::io::{Cursor, Seek, SeekFrom};
 use std::path::Path;
 
+/// Generic errors pertaining to disassembly
+#[derive(Error, Debug)]
+pub enum DisassembleError {
+    /// Most commonly this includes "file not found" errors
+    #[error("io error")]
+    IOError(#[from] std::io::Error),
+
+    /// An byte we read does not seem to have a corresponding opcode
+    #[error("bad opcode")]
+    BadOpcode(#[from] ::num_enum::TryFromPrimitiveError<RawOpcode>),
+
+    /// Generic ysc error
+    #[error("ysc error")]
+    YscError(#[from] YscError),
+}
+
+/// A global reference with one or more offsets
 pub struct GlobalReference {
     index: u32,
     offsets: Vec<u32>,
 }
 
 impl GlobalReference {
+    /// Create a global reference given an index and one or more offsets
     pub fn new(index: u32, offsets: Vec<u32>) -> Self {
         Self { index, offsets }
     }
 }
 
+/// Information needed to find a global reference across different versions of the same script
 #[derive(Debug)]
 pub struct GlobalSignature {
     enter_offset: Option<i32>,
@@ -28,31 +47,35 @@ pub struct GlobalSignature {
     hint: usize,
 }
 
-pub struct DisassembledScript {
-    pub instructions: Vec<Opcode>,
+/// List of script instructions, used for global matching
+pub struct InstructionList {
+    /// Vector of ScriptVM instructions
+    pub instructions: Vec<Instruction>,
 }
 
 const PREV_OPCODE_SIG_LENGTH: usize = 15;
 
-impl DisassembledScript {
-    pub fn new(instructions: Vec<Opcode>) -> Self {
+impl InstructionList {
+    /// Create a ScriptInstructionList given a list of instructions
+    pub fn new(instructions: Vec<Instruction>) -> Self {
         Self { instructions }
     }
 
-    pub fn from_ysc_file(path: impl AsRef<Path>) -> Result<Self, Error> {
+    /// Create a ScriptInstructionList given a path to a ysc file
+    pub fn from_ysc_file(path: impl AsRef<Path>) -> Result<Self, DisassembleError> {
         let src = std::fs::read(path)?;
-        let ysc = YSC::new(&src)?.get_script()?;
+        let ysc = YSCReader::new(&src)?.get_script()?;
         let script = Disassembler::new(&ysc).disassemble(None)?;
 
         Ok(script)
     }
-
-    pub fn get_pretty(&self, ops: &[Opcode]) -> String {
+    /// Poor mans way getting a C like string from a global reference with optional offsets and arrays
+    pub fn get_pretty(&self, ops: &[Instruction]) -> String {
         let mut string_buf = "".to_owned();
         for op in ops {
-            if let Some(global_index) = DisassembledScript::get_global_index(op) {
+            if let Some(global_index) = InstructionList::get_global_index(op) {
                 string_buf += &format!("Global_{global_index}");
-            } else if let Some(offset) = DisassembledScript::get_global_offset_value(op) {
+            } else if let Some(offset) = InstructionList::get_global_offset_value(op) {
                 if format!("{op:?}").to_lowercase().contains("array") {
                     /* hacky way to detect arrays */
                     string_buf += &format!("[? /*{offset}*/]");
@@ -64,10 +87,11 @@ impl DisassembledScript {
 
         string_buf
     }
+
     fn find_from_signature_given_instructions<'a>(
         signature: &GlobalSignature,
-        instructions: &'a [Opcode],
-    ) -> Option<(&'a [Opcode], bool)> {
+        instructions: &'a [Instruction],
+    ) -> Option<(&'a [Instruction], bool)> {
         let mut prev_opcode_answer = 0;
         let mut enter_answer = false;
 
@@ -89,7 +113,7 @@ impl DisassembledScript {
 
             if let Some(offset) = &signature.enter_offset {
                 if *offset < prev_opcode_answer as i32 {
-                    if let Opcode::Enter { .. } =
+                    if let Instruction::Enter { .. } =
                         &instructions[prev_opcode_answer - *offset as usize]
                     {
                         enter_answer = true;
@@ -105,10 +129,13 @@ impl DisassembledScript {
 
         None
     }
+
+    /// Try to find a global reference in a script given a Vec of GlobalSignatures
+    /// If the bool is true, there is a higher chance that the reference is correct
     pub fn find_from_signatures(
         &self,
         signatures: &Vec<GlobalSignature>,
-    ) -> Option<Vec<(&[Opcode], bool)>> {
+    ) -> Option<Vec<(&[Instruction], bool)>> {
         let mut results = Vec::new();
         for sig in signatures {
             if let Some(res) = self.find_from_signature(sig) {
@@ -123,21 +150,24 @@ impl DisassembledScript {
         }
     }
 
-    pub fn find_from_signature(&self, signature: &GlobalSignature) -> Option<(&[Opcode], bool)> {
-        return if let Some(res) = DisassembledScript::find_from_signature_given_instructions(
+    /// Try to find a global reference in a script given a GlobalSignatures
+    /// If the bool is true, there is a higher chance that the reference is correct
+    pub fn find_from_signature(&self, signature: &GlobalSignature) -> Option<(&[Instruction], bool)> {
+        return if let Some(res) = InstructionList::find_from_signature_given_instructions(
             signature,
             &self.instructions[(max(signature.hint as i64 - 512, 0) as usize)
                 ..min(signature.hint + 512, self.instructions.len() - 1)],
         ) {
             Some(res)
         } else {
-            DisassembledScript::find_from_signature_given_instructions(
+            InstructionList::find_from_signature_given_instructions(
                 signature,
                 &self.instructions,
             )
         };
     }
 
+    /// Generate signatures given a global index and the number of instructions after which specify the offset
     pub fn generate_signatures(
         &self,
         indexes_and_sizes: &[(usize, usize)],
@@ -148,6 +178,7 @@ impl DisassembledScript {
             .collect()
     }
 
+    /// Generate a signature given a global index and the number of instructions after which specify the offset
     pub fn generate_signature(&self, index_and_size: &(usize, usize)) -> GlobalSignature {
         let (index, size) = *index_and_size;
 
@@ -166,7 +197,7 @@ impl DisassembledScript {
                 break;
             }
             let opcode = &self.instructions[index - offset];
-            if let Opcode::Enter { .. } = opcode {
+            if let Instruction::Enter { .. } = opcode {
                 enter_offset = Some(offset as i32);
                 break;
             }
@@ -180,37 +211,38 @@ impl DisassembledScript {
         }
     }
 
-    fn get_global_index(op: &Opcode) -> Option<u32> {
+    fn get_global_index(op: &Instruction) -> Option<u32> {
         match op {
-            Opcode::GlobalU16 { index } => Some(*index as u32),
-            Opcode::GlobalU16Store { index } => Some(*index as u32),
-            Opcode::GlobalU16Load { index } => Some(*index as u32),
-            Opcode::GlobalU24 { index } => Some(*index),
-            Opcode::GlobalU24Store { index } => Some(*index),
-            Opcode::GlobalU24Load { index } => Some(*index),
+            Instruction::GlobalU16 { index } => Some(*index as u32),
+            Instruction::GlobalU16Store { index } => Some(*index as u32),
+            Instruction::GlobalU16Load { index } => Some(*index as u32),
+            Instruction::GlobalU24 { index } => Some(*index),
+            Instruction::GlobalU24Store { index } => Some(*index),
+            Instruction::GlobalU24Load { index } => Some(*index),
             _ => None,
         }
     }
 
-    fn get_global_offset_value(op: &Opcode) -> Option<u32> {
+    fn get_global_offset_value(op: &Instruction) -> Option<u32> {
         match op {
-            Opcode::IoffsetU8 { offset } => Some(*offset as u32),
-            Opcode::IoffsetU8Load { offset } => Some(*offset as u32),
-            Opcode::IoffsetU8Store { offset } => Some(*offset as u32),
-            Opcode::IoffsetS16 { offset } => Some(*offset as u32),
-            Opcode::IoffsetS16Load { offset } => Some(*offset as u32),
-            Opcode::IoffsetS16Store { offset } => Some(*offset as u32),
-            Opcode::PushConstU24 { num } => Some(*num),
-            Opcode::ArrayU8 { size } => Some(*size as u32),
-            Opcode::ArrayU8Store { size } => Some(*size as u32),
-            Opcode::ArrayU8Load { size } => Some(*size as u32),
-            Opcode::ArrayU16 { size } => Some(*size as u32),
-            Opcode::ArrayU16Store { size } => Some(*size as u32),
-            Opcode::ArrayU16Load { size } => Some(*size as u32),
+            Instruction::IoffsetU8 { offset } => Some(*offset as u32),
+            Instruction::IoffsetU8Load { offset } => Some(*offset as u32),
+            Instruction::IoffsetU8Store { offset } => Some(*offset as u32),
+            Instruction::IoffsetS16 { offset } => Some(*offset as u32),
+            Instruction::IoffsetS16Load { offset } => Some(*offset as u32),
+            Instruction::IoffsetS16Store { offset } => Some(*offset as u32),
+            Instruction::PushConstU24 { num } => Some(*num),
+            Instruction::ArrayU8 { size } => Some(*size as u32),
+            Instruction::ArrayU8Store { size } => Some(*size as u32),
+            Instruction::ArrayU8Load { size } => Some(*size as u32),
+            Instruction::ArrayU16 { size } => Some(*size as u32),
+            Instruction::ArrayU16Store { size } => Some(*size as u32),
+            Instruction::ArrayU16Load { size } => Some(*size as u32),
             _ => None,
         }
     }
 
+    /// Find multiple locations and sizes of GlobalReferences in a script from the beginning
     pub fn find_global_references(
         &self,
         global_ref: &GlobalReference,
@@ -234,10 +266,12 @@ impl DisassembledScript {
         }
     }
 
+    /// Find locations and sizes of GlobalReferences in a script from the beginning
     pub fn find_global_reference(&self, global_ref: &GlobalReference) -> Option<(usize, usize)> {
         self.find_global_reference_from(global_ref, 0)
     }
 
+    /// Find locations and sizes of GlobalReferences in a script given the starting index
     pub fn find_global_reference_from(
         &self,
         global_ref: &GlobalReference,
@@ -250,14 +284,14 @@ impl DisassembledScript {
         let mut offset_index = 0;
 
         while i < len {
-            if let Some(global_value) = DisassembledScript::get_global_index(&self.instructions[i])
+            if let Some(global_value) = InstructionList::get_global_index(&self.instructions[i])
             {
                 in_global = global_value == global_ref.index;
                 if empty && in_global {
                     return Some((i, 1));
                 }
             } else if let Some(offset) =
-                DisassembledScript::get_global_offset_value(&self.instructions[i])
+                InstructionList::get_global_offset_value(&self.instructions[i])
             {
                 if in_global && !empty {
                     if global_ref.offsets[offset_index] == offset {
@@ -285,19 +319,24 @@ impl DisassembledScript {
     }
 }
 
+/// ScriptVM disassembler
 pub struct Disassembler<'a> {
     script: &'a YSCScript,
     current_stack_top: i64,
 }
 
 impl<'a> Disassembler<'a> {
+    /// Creates a disassembler given a borrowed YSCScript
+    /// Disassembler needs to access the code blocks, string table, native table, etc.. of the script, but won't mutate it
     pub fn new(script: &'a YSCScript) -> Self {
         Self {
             script,
             current_stack_top: 0,
         }
     }
-    pub fn disassemble(&mut self, func_index: Option<usize>) -> Result<DisassembledScript, Error> {
+
+    /// Disassembles a function, or an entire script (if func_index is None)
+    pub fn disassemble(&mut self, func_index: Option<usize>) -> Result<InstructionList, DisassembleError> {
         let mut cursor = Cursor::new(&self.script.code[..]);
         cursor.set_position(0);
 
@@ -329,7 +368,7 @@ impl<'a> Disassembler<'a> {
             inst = self.disassemble_opcode(&raw, &mut cursor)?;
 
             if is_enter_opcode {
-                if let Opcode::Enter { index, .. } = &mut inst {
+                if let Instruction::Enter { index, .. } = &mut inst {
                     *index = Some(current_func_index);
                 }
                 current_func_index += 1;
@@ -341,7 +380,7 @@ impl<'a> Disassembler<'a> {
         }
 
         for opcode in &mut opcodes {
-            if let Opcode::Call {
+            if let Instruction::Call {
                 func_index,
                 location,
             } = opcode
@@ -351,84 +390,84 @@ impl<'a> Disassembler<'a> {
             }
         }
 
-        Ok(DisassembledScript::new(opcodes))
+        Ok(InstructionList::new(opcodes))
     }
 
     fn disassemble_opcode(
         &mut self,
         raw_op: &RawOpcode,
         cursor: &mut Cursor<&[u8]>,
-    ) -> Result<Opcode, Error> {
+    ) -> Result<Instruction, DisassembleError> {
         match raw_op {
-            RawOpcode::Nop => Ok(Opcode::Nop),
-            RawOpcode::Iadd => Ok(Opcode::Iadd),
-            RawOpcode::Isub => Ok(Opcode::Isub),
-            RawOpcode::Imul => Ok(Opcode::Imul),
-            RawOpcode::Idiv => Ok(Opcode::Idiv),
-            RawOpcode::Imod => Ok(Opcode::Imod),
-            RawOpcode::Inot => Ok(Opcode::Inot),
-            RawOpcode::Ineg => Ok(Opcode::Ineg),
-            RawOpcode::Ieq => Ok(Opcode::Ieq),
-            RawOpcode::Ine => Ok(Opcode::Ine),
-            RawOpcode::Igt => Ok(Opcode::Igt),
-            RawOpcode::Ige => Ok(Opcode::Ige),
-            RawOpcode::Ilt => Ok(Opcode::Ilt),
-            RawOpcode::Ile => Ok(Opcode::Ile),
-            RawOpcode::Fadd => Ok(Opcode::Fadd),
-            RawOpcode::Fsub => Ok(Opcode::Fsub),
-            RawOpcode::Fmul => Ok(Opcode::Fmul),
-            RawOpcode::Fdiv => Ok(Opcode::Fdiv),
-            RawOpcode::Fmod => Ok(Opcode::Fmod),
-            RawOpcode::Fneg => Ok(Opcode::Fneg),
-            RawOpcode::Feq => Ok(Opcode::Feq),
-            RawOpcode::Fne => Ok(Opcode::Fne),
-            RawOpcode::Fgt => Ok(Opcode::Fgt),
-            RawOpcode::Fge => Ok(Opcode::Fge),
-            RawOpcode::Flt => Ok(Opcode::Flt),
-            RawOpcode::Fle => Ok(Opcode::Fle),
-            RawOpcode::Vadd => Ok(Opcode::Vadd),
-            RawOpcode::Vsub => Ok(Opcode::Vsub),
-            RawOpcode::Vmul => Ok(Opcode::Vmul),
-            RawOpcode::Vdiv => Ok(Opcode::Vdiv),
-            RawOpcode::Vneg => Ok(Opcode::Vneg),
-            RawOpcode::Iand => Ok(Opcode::Iand),
-            RawOpcode::Ior => Ok(Opcode::Ior),
-            RawOpcode::Ixor => Ok(Opcode::Ixor),
-            RawOpcode::I2F => Ok(Opcode::I2f),
-            RawOpcode::F2I => Ok(Opcode::F2i),
-            RawOpcode::F2V => Ok(Opcode::F2v),
+            RawOpcode::Nop => Ok(Instruction::Nop),
+            RawOpcode::Iadd => Ok(Instruction::Iadd),
+            RawOpcode::Isub => Ok(Instruction::Isub),
+            RawOpcode::Imul => Ok(Instruction::Imul),
+            RawOpcode::Idiv => Ok(Instruction::Idiv),
+            RawOpcode::Imod => Ok(Instruction::Imod),
+            RawOpcode::Inot => Ok(Instruction::Inot),
+            RawOpcode::Ineg => Ok(Instruction::Ineg),
+            RawOpcode::Ieq => Ok(Instruction::Ieq),
+            RawOpcode::Ine => Ok(Instruction::Ine),
+            RawOpcode::Igt => Ok(Instruction::Igt),
+            RawOpcode::Ige => Ok(Instruction::Ige),
+            RawOpcode::Ilt => Ok(Instruction::Ilt),
+            RawOpcode::Ile => Ok(Instruction::Ile),
+            RawOpcode::Fadd => Ok(Instruction::Fadd),
+            RawOpcode::Fsub => Ok(Instruction::Fsub),
+            RawOpcode::Fmul => Ok(Instruction::Fmul),
+            RawOpcode::Fdiv => Ok(Instruction::Fdiv),
+            RawOpcode::Fmod => Ok(Instruction::Fmod),
+            RawOpcode::Fneg => Ok(Instruction::Fneg),
+            RawOpcode::Feq => Ok(Instruction::Feq),
+            RawOpcode::Fne => Ok(Instruction::Fne),
+            RawOpcode::Fgt => Ok(Instruction::Fgt),
+            RawOpcode::Fge => Ok(Instruction::Fge),
+            RawOpcode::Flt => Ok(Instruction::Flt),
+            RawOpcode::Fle => Ok(Instruction::Fle),
+            RawOpcode::Vadd => Ok(Instruction::Vadd),
+            RawOpcode::Vsub => Ok(Instruction::Vsub),
+            RawOpcode::Vmul => Ok(Instruction::Vmul),
+            RawOpcode::Vdiv => Ok(Instruction::Vdiv),
+            RawOpcode::Vneg => Ok(Instruction::Vneg),
+            RawOpcode::Iand => Ok(Instruction::Iand),
+            RawOpcode::Ior => Ok(Instruction::Ior),
+            RawOpcode::Ixor => Ok(Instruction::Ixor),
+            RawOpcode::I2F => Ok(Instruction::I2f),
+            RawOpcode::F2I => Ok(Instruction::F2i),
+            RawOpcode::F2V => Ok(Instruction::F2v),
             RawOpcode::PushConstU8 => {
                 self.current_stack_top = cursor.read_u8()? as i64;
-                Ok(Opcode::PushConstU8 {
+                Ok(Instruction::PushConstU8 {
                     one: self.current_stack_top as u8,
                 })
             }
-            RawOpcode::PushConstU8U8 => Ok(Opcode::PushConstU8U8 {
+            RawOpcode::PushConstU8U8 => Ok(Instruction::PushConstU8U8 {
                 one: cursor.read_u8()?,
                 two: cursor.read_u8()?,
             }),
-            RawOpcode::PushConstU8U8U8 => Ok(Opcode::PushConstU8U8U8 {
+            RawOpcode::PushConstU8U8U8 => Ok(Instruction::PushConstU8U8U8 {
                 one: cursor.read_u8()?,
                 two: cursor.read_u8()?,
                 three: cursor.read_u8()?,
             }),
             RawOpcode::PushConstU32 => {
                 self.current_stack_top = cursor.read_u32::<LittleEndian>()? as i64;
-                Ok(Opcode::PushConstU32 {
+                Ok(Instruction::PushConstU32 {
                     one: self.current_stack_top as u32,
                 })
             }
-            RawOpcode::PushConstF => Ok(Opcode::PushConstF {
+            RawOpcode::PushConstF => Ok(Instruction::PushConstF {
                 one: cursor.read_f32::<LittleEndian>()?,
             }),
-            RawOpcode::Dup => Ok(Opcode::Dup),
-            RawOpcode::Drop => Ok(Opcode::Drop),
+            RawOpcode::Dup => Ok(Instruction::Dup),
+            RawOpcode::Drop => Ok(Instruction::Drop),
             RawOpcode::Native => {
                 let packed_args_and_returns = cursor.read_u8()?;
                 let num_args = packed_args_and_returns >> 2;
                 let num_returns = packed_args_and_returns & 0b11;
                 let native_table_index = cursor.read_u16::<BigEndian>()?;
-                Ok(Opcode::Native {
+                Ok(Instruction::Native {
                     num_args,
                     num_returns,
                     native_table_index,
@@ -440,171 +479,171 @@ impl<'a> Disassembler<'a> {
                 let stack_variables = cursor.read_u16::<LittleEndian>()?;
                 let skip = cursor.read_u8()?;
                 cursor.seek(SeekFrom::Current(skip as i64))?;
-                Ok(Opcode::Enter {
+                Ok(Instruction::Enter {
                     arg_count,
                     stack_variables,
                     skip,
                     index: None,
                 })
             }
-            RawOpcode::Leave => Ok(Opcode::Leave {
+            RawOpcode::Leave => Ok(Instruction::Leave {
                 arg_count: cursor.read_u8()?,
                 return_address_index: cursor.read_u8()?,
             }),
-            RawOpcode::Load => Ok(Opcode::Load),
-            RawOpcode::Store => Ok(Opcode::Store),
-            RawOpcode::StoreRev => Ok(Opcode::StoreRev),
-            RawOpcode::LoadN => Ok(Opcode::LoadN),
-            RawOpcode::StoreN => Ok(Opcode::StoreN),
-            RawOpcode::ArrayU8 => Ok(Opcode::ArrayU8 {
+            RawOpcode::Load => Ok(Instruction::Load),
+            RawOpcode::Store => Ok(Instruction::Store),
+            RawOpcode::StoreRev => Ok(Instruction::StoreRev),
+            RawOpcode::LoadN => Ok(Instruction::LoadN),
+            RawOpcode::StoreN => Ok(Instruction::StoreN),
+            RawOpcode::ArrayU8 => Ok(Instruction::ArrayU8 {
                 size: cursor.read_u8()?,
             }),
-            RawOpcode::ArrayU8Load => Ok(Opcode::ArrayU8Load {
+            RawOpcode::ArrayU8Load => Ok(Instruction::ArrayU8Load {
                 size: cursor.read_u8()?,
             }),
-            RawOpcode::ArrayU8Store => Ok(Opcode::ArrayU8Store {
+            RawOpcode::ArrayU8Store => Ok(Instruction::ArrayU8Store {
                 size: cursor.read_u8()?,
             }),
-            RawOpcode::LocalU8 => Ok(Opcode::LocalU8 {
+            RawOpcode::LocalU8 => Ok(Instruction::LocalU8 {
                 frame_index: cursor.read_u8()?,
             }),
-            RawOpcode::LocalU8Load => Ok(Opcode::LocalU8Load {
+            RawOpcode::LocalU8Load => Ok(Instruction::LocalU8Load {
                 frame_index: cursor.read_u8()?,
             }),
-            RawOpcode::LocalU8Store => Ok(Opcode::LocalU8Store {
+            RawOpcode::LocalU8Store => Ok(Instruction::LocalU8Store {
                 frame_index: cursor.read_u8()?,
             }),
-            RawOpcode::StaticU8 => Ok(Opcode::StaticU8 {
+            RawOpcode::StaticU8 => Ok(Instruction::StaticU8 {
                 static_var_index: cursor.read_u8()?,
             }),
-            RawOpcode::StaticU8Load => Ok(Opcode::StaticU8Load {
+            RawOpcode::StaticU8Load => Ok(Instruction::StaticU8Load {
                 static_var_index: cursor.read_u8()?,
             }),
-            RawOpcode::StaticU8Store => Ok(Opcode::StaticU8Store {
+            RawOpcode::StaticU8Store => Ok(Instruction::StaticU8Store {
                 static_var_index: cursor.read_u8()?,
             }),
-            RawOpcode::IaddU8 => Ok(Opcode::IaddU8 {
+            RawOpcode::IaddU8 => Ok(Instruction::IaddU8 {
                 num: cursor.read_u8()?,
             }),
-            RawOpcode::ImulU8 => Ok(Opcode::ImulU8 {
+            RawOpcode::ImulU8 => Ok(Instruction::ImulU8 {
                 num: cursor.read_u8()?,
             }),
-            RawOpcode::Ioffset => Ok(Opcode::Ioffset),
-            RawOpcode::IoffsetU8 => Ok(Opcode::IoffsetU8 {
+            RawOpcode::Ioffset => Ok(Instruction::Ioffset),
+            RawOpcode::IoffsetU8 => Ok(Instruction::IoffsetU8 {
                 offset: cursor.read_u8()?,
             }),
-            RawOpcode::IoffsetU8Load => Ok(Opcode::IoffsetU8Load {
+            RawOpcode::IoffsetU8Load => Ok(Instruction::IoffsetU8Load {
                 offset: cursor.read_u8()?,
             }),
-            RawOpcode::IoffsetU8Store => Ok(Opcode::IoffsetU8Store {
+            RawOpcode::IoffsetU8Store => Ok(Instruction::IoffsetU8Store {
                 offset: cursor.read_u8()?,
             }),
             RawOpcode::PushConstS16 => {
                 self.current_stack_top = cursor.read_i16::<LittleEndian>()? as i64;
-                Ok(Opcode::PushConstS16 {
+                Ok(Instruction::PushConstS16 {
                     num: self.current_stack_top as i16,
                 })
             }
-            RawOpcode::IaddS16 => Ok(Opcode::IaddS16 {
+            RawOpcode::IaddS16 => Ok(Instruction::IaddS16 {
                 num: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::ImulS16 => Ok(Opcode::ImulS16 {
+            RawOpcode::ImulS16 => Ok(Instruction::ImulS16 {
                 num: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IoffsetS16 => Ok(Opcode::IoffsetS16 {
+            RawOpcode::IoffsetS16 => Ok(Instruction::IoffsetS16 {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IoffsetS16Load => Ok(Opcode::IoffsetS16Load {
+            RawOpcode::IoffsetS16Load => Ok(Instruction::IoffsetS16Load {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IoffsetS16Store => Ok(Opcode::IoffsetS16Store {
+            RawOpcode::IoffsetS16Store => Ok(Instruction::IoffsetS16Store {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::ArrayU16 => Ok(Opcode::ArrayU16 {
+            RawOpcode::ArrayU16 => Ok(Instruction::ArrayU16 {
                 size: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::ArrayU16Load => Ok(Opcode::ArrayU16Load {
+            RawOpcode::ArrayU16Load => Ok(Instruction::ArrayU16Load {
                 size: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::ArrayU16Store => Ok(Opcode::ArrayU16Store {
+            RawOpcode::ArrayU16Store => Ok(Instruction::ArrayU16Store {
                 size: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::LocalU16 => Ok(Opcode::LocalU16 {
+            RawOpcode::LocalU16 => Ok(Instruction::LocalU16 {
                 frame_index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::LocalU16Load => Ok(Opcode::LocalU16Load {
+            RawOpcode::LocalU16Load => Ok(Instruction::LocalU16Load {
                 frame_index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::LocalU16Store => Ok(Opcode::LocalU16Store {
+            RawOpcode::LocalU16Store => Ok(Instruction::LocalU16Store {
                 frame_index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::StaticU16 => Ok(Opcode::StaticU16 {
+            RawOpcode::StaticU16 => Ok(Instruction::StaticU16 {
                 static_var_index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::StaticU16Load => Ok(Opcode::StaticU16Load {
+            RawOpcode::StaticU16Load => Ok(Instruction::StaticU16Load {
                 static_var_index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::StaticU16Store => Ok(Opcode::StaticU16Store {
+            RawOpcode::StaticU16Store => Ok(Instruction::StaticU16Store {
                 static_var_index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::GlobalU16 => Ok(Opcode::GlobalU16 {
+            RawOpcode::GlobalU16 => Ok(Instruction::GlobalU16 {
                 index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::GlobalU16Load => Ok(Opcode::GlobalU16Load {
+            RawOpcode::GlobalU16Load => Ok(Instruction::GlobalU16Load {
                 index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::GlobalU16Store => Ok(Opcode::GlobalU16Store {
+            RawOpcode::GlobalU16Store => Ok(Instruction::GlobalU16Store {
                 index: cursor.read_u16::<LittleEndian>()?,
             }),
-            RawOpcode::J => Ok(Opcode::J {
+            RawOpcode::J => Ok(Instruction::J {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::Jz => Ok(Opcode::Jz {
+            RawOpcode::Jz => Ok(Instruction::Jz {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IeqJz => Ok(Opcode::IEqJz {
+            RawOpcode::IeqJz => Ok(Instruction::IEqJz {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IneJz => Ok(Opcode::INeJz {
+            RawOpcode::IneJz => Ok(Instruction::INeJz {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IgtJz => Ok(Opcode::IGtJz {
+            RawOpcode::IgtJz => Ok(Instruction::IGtJz {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IgeJz => Ok(Opcode::IGeJz {
+            RawOpcode::IgeJz => Ok(Instruction::IGeJz {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IltJz => Ok(Opcode::ILtJz {
+            RawOpcode::IltJz => Ok(Instruction::ILtJz {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::IleJz => Ok(Opcode::ILeJz {
+            RawOpcode::IleJz => Ok(Instruction::ILeJz {
                 offset: cursor.read_i16::<LittleEndian>()?,
             }),
-            RawOpcode::Call => Ok(Opcode::Call {
+            RawOpcode::Call => Ok(Instruction::Call {
                 location: cursor.read_u24::<LittleEndian>()?,
                 func_index: None,
             }),
-            RawOpcode::LocalU24 => Ok(Opcode::LocalU24 {
+            RawOpcode::LocalU24 => Ok(Instruction::LocalU24 {
                 frame_index: cursor.read_u24::<LittleEndian>()?,
             }),
-            RawOpcode::LocalU24Load => Ok(Opcode::LocalU24Load {
+            RawOpcode::LocalU24Load => Ok(Instruction::LocalU24Load {
                 frame_index: cursor.read_u24::<LittleEndian>()?,
             }),
-            RawOpcode::LocalU24Store => Ok(Opcode::LocalU24Store {
+            RawOpcode::LocalU24Store => Ok(Instruction::LocalU24Store {
                 frame_index: cursor.read_u24::<LittleEndian>()?,
             }),
-            RawOpcode::GlobalU24 => Ok(Opcode::GlobalU24 {
+            RawOpcode::GlobalU24 => Ok(Instruction::GlobalU24 {
                 index: cursor.read_u24::<LittleEndian>()?,
             }),
-            RawOpcode::GlobalU24Load => Ok(Opcode::GlobalU24Load {
+            RawOpcode::GlobalU24Load => Ok(Instruction::GlobalU24Load {
                 index: cursor.read_u24::<LittleEndian>()?,
             }),
-            RawOpcode::GlobalU24Store => Ok(Opcode::GlobalU24Store {
+            RawOpcode::GlobalU24Store => Ok(Instruction::GlobalU24Store {
                 index: cursor.read_u24::<LittleEndian>()?,
             }),
             RawOpcode::PushConstU24 => {
                 self.current_stack_top = cursor.read_u24::<LittleEndian>()? as i64;
-                Ok(Opcode::PushConstU24 {
+                Ok(Instruction::PushConstU24 {
                     num: self.current_stack_top as u32,
                 })
             }
@@ -624,7 +663,7 @@ impl<'a> Disassembler<'a> {
                     entries.push(entry);
                 }
 
-                Ok(Opcode::Switch {
+                Ok(Instruction::Switch {
                     num_of_entries: num_entries,
                     entries,
                 })
@@ -632,12 +671,12 @@ impl<'a> Disassembler<'a> {
             RawOpcode::String => {
                 let key = &(self.current_stack_top as usize);
                 if self.script.strings.contains_key(key) {
-                    Ok(Opcode::String {
+                    Ok(Instruction::String {
                         index: *key,
                         value: self.script.strings[key].to_string(),
                     })
                 } else {
-                    Ok(Opcode::String {
+                    Ok(Instruction::String {
                         index: *key,
                         value: self
                             .script
@@ -646,72 +685,73 @@ impl<'a> Disassembler<'a> {
                     })
                 }
             }
-            RawOpcode::StringHash => Ok(Opcode::StringHash),
-            RawOpcode::TextLabelAssignString => Ok(Opcode::TextLabelAssignString {
+            RawOpcode::StringHash => Ok(Instruction::StringHash),
+            RawOpcode::TextLabelAssignString => Ok(Instruction::TextLabelAssignString {
                 size: cursor.read_u8()?,
             }),
-            RawOpcode::TextLabelAssignInt => Ok(Opcode::TextLabelAssignInt {
+            RawOpcode::TextLabelAssignInt => Ok(Instruction::TextLabelAssignInt {
                 size: cursor.read_u8()?,
             }),
-            RawOpcode::TextLabelAppendString => Ok(Opcode::TextLabelAppendString {
+            RawOpcode::TextLabelAppendString => Ok(Instruction::TextLabelAppendString {
                 size: cursor.read_u8()?,
             }),
-            RawOpcode::TextLabelAppendInt => Ok(Opcode::TextLabelAppendInt {
+            RawOpcode::TextLabelAppendInt => Ok(Instruction::TextLabelAppendInt {
                 size: cursor.read_u8()?,
             }),
-            RawOpcode::TextLabelCopy => Ok(Opcode::TextLabelCopy),
-            RawOpcode::Catch => Ok(Opcode::Catch),
-            RawOpcode::Throw => Ok(Opcode::Throw),
-            RawOpcode::CallIndirect => Ok(Opcode::CallIndirect),
-            RawOpcode::PushConstM1 => Ok(Opcode::PushConstM1),
+            RawOpcode::TextLabelCopy => Ok(Instruction::TextLabelCopy),
+            RawOpcode::Catch => Ok(Instruction::Catch),
+            RawOpcode::Throw => Ok(Instruction::Throw),
+            RawOpcode::CallIndirect => Ok(Instruction::CallIndirect),
+            RawOpcode::PushConstM1 => Ok(Instruction::PushConstM1),
             RawOpcode::PushConst0 => {
                 self.current_stack_top = 0;
-                Ok(Opcode::PushConst0)
+                Ok(Instruction::PushConst0)
             }
             RawOpcode::PushConst1 => {
                 self.current_stack_top = 1;
-                Ok(Opcode::PushConst1)
+                Ok(Instruction::PushConst1)
             }
             RawOpcode::PushConst2 => {
                 self.current_stack_top = 2;
-                Ok(Opcode::PushConst2)
+                Ok(Instruction::PushConst2)
             }
             RawOpcode::PushConst3 => {
                 self.current_stack_top = 3;
-                Ok(Opcode::PushConst3)
+                Ok(Instruction::PushConst3)
             }
             RawOpcode::PushConst4 => {
                 self.current_stack_top = 4;
-                Ok(Opcode::PushConst4)
+                Ok(Instruction::PushConst4)
             }
             RawOpcode::PushConst5 => {
                 self.current_stack_top = 5;
-                Ok(Opcode::PushConst5)
+                Ok(Instruction::PushConst5)
             }
             RawOpcode::PushConst6 => {
                 self.current_stack_top = 6;
-                Ok(Opcode::PushConst6)
+                Ok(Instruction::PushConst6)
             }
             RawOpcode::PushConst7 => {
                 self.current_stack_top = 7;
-                Ok(Opcode::PushConst7)
+                Ok(Instruction::PushConst7)
             }
-            RawOpcode::PushConstFm1 => Ok(Opcode::PushConstFM1),
-            RawOpcode::PushConstF0 => Ok(Opcode::PushConstF0),
-            RawOpcode::PushConstF1 => Ok(Opcode::PushConstF1),
-            RawOpcode::PushConstF2 => Ok(Opcode::PushConstF2),
-            RawOpcode::PushConstF3 => Ok(Opcode::PushConstF3),
-            RawOpcode::PushConstF4 => Ok(Opcode::PushConstF4),
-            RawOpcode::PushConstF5 => Ok(Opcode::PushConstF5),
-            RawOpcode::PushConstF6 => Ok(Opcode::PushConstF6),
-            RawOpcode::PushConstF7 => Ok(Opcode::PushConstF7),
-            RawOpcode::IsBitSet => Ok(Opcode::IsBitSet),
+            RawOpcode::PushConstFm1 => Ok(Instruction::PushConstFM1),
+            RawOpcode::PushConstF0 => Ok(Instruction::PushConstF0),
+            RawOpcode::PushConstF1 => Ok(Instruction::PushConstF1),
+            RawOpcode::PushConstF2 => Ok(Instruction::PushConstF2),
+            RawOpcode::PushConstF3 => Ok(Instruction::PushConstF3),
+            RawOpcode::PushConstF4 => Ok(Instruction::PushConstF4),
+            RawOpcode::PushConstF5 => Ok(Instruction::PushConstF5),
+            RawOpcode::PushConstF6 => Ok(Instruction::PushConstF6),
+            RawOpcode::PushConstF7 => Ok(Instruction::PushConstF7),
+            RawOpcode::IsBitSet => Ok(Instruction::IsBitSet),
         }
     }
 }
 
+#[allow(missing_docs)]
 #[derive(Debug, EnumIndex, Clone)]
-pub enum Opcode {
+pub enum Instruction {
     Nop,
     Iadd,
     Isub,
@@ -982,166 +1022,316 @@ pub enum Opcode {
     IsBitSet,
 }
 
-impl Opcode {
-    pub fn is_jump(&self) -> Option<i16> {
+impl Instruction {
+    /// Returns the offset of a jump instrution, if it is one
+    pub fn get_jump_offset(&self) -> Option<i16> {
         match &self {
-            Opcode::Jz { offset } => Some(*offset),
-            Opcode::ILtJz { offset } => Some(*offset),
-            Opcode::ILeJz { offset } => Some(*offset),
-            Opcode::INeJz { offset } => Some(*offset),
-            Opcode::IEqJz { offset } => Some(*offset),
-            Opcode::IGtJz { offset } => Some(*offset),
-            Opcode::IGeJz { offset } => Some(*offset),
-            Opcode::J { offset } => Some(*offset),
+            Instruction::Jz { offset } => Some(*offset),
+            Instruction::ILtJz { offset } => Some(*offset),
+            Instruction::ILeJz { offset } => Some(*offset),
+            Instruction::INeJz { offset } => Some(*offset),
+            Instruction::IEqJz { offset } => Some(*offset),
+            Instruction::IGtJz { offset } => Some(*offset),
+            Instruction::IGeJz { offset } => Some(*offset),
+            Instruction::J { offset } => Some(*offset),
             _ => None,
         }
     }
+
+    /// Returns the size (in bytes) of the opcode
     pub fn get_size(&self) -> usize {
         match &self {
-            Opcode::Nop => 1,
-            Opcode::Iadd => 1,
-            Opcode::Isub => 1,
-            Opcode::Imul => 1,
-            Opcode::Idiv => 1,
-            Opcode::Imod => 1,
-            Opcode::Inot => 1,
-            Opcode::Ineg => 1,
-            Opcode::Ieq => 1,
-            Opcode::Ine => 1,
-            Opcode::Igt => 1,
-            Opcode::Ige => 1,
-            Opcode::Ilt => 1,
-            Opcode::Ile => 1,
-            Opcode::Fadd => 1,
-            Opcode::Fsub => 1,
-            Opcode::Fmul => 1,
-            Opcode::Fdiv => 1,
-            Opcode::Fmod => 1,
-            Opcode::Fneg => 1,
-            Opcode::Feq => 1,
-            Opcode::Fne => 1,
-            Opcode::Fgt => 1,
-            Opcode::Fge => 1,
-            Opcode::Flt => 1,
-            Opcode::Fle => 1,
-            Opcode::Vadd => 1,
-            Opcode::Vsub => 1,
-            Opcode::Vmul => 1,
-            Opcode::Vdiv => 1,
-            Opcode::Vneg => 1,
-            Opcode::Iand => 1,
-            Opcode::Ior => 1,
-            Opcode::Ixor => 1,
-            Opcode::I2f => 1,
-            Opcode::F2i => 1,
-            Opcode::F2v => 1,
-            Opcode::PushConstU8 { .. } => 2,
-            Opcode::PushConstU8U8 { .. } => 3,
-            Opcode::PushConstU8U8U8 { .. } => 4,
-            Opcode::PushConstU32 { .. } => 5,
-            Opcode::PushConstF { .. } => 5,
-            Opcode::Dup => 1,
-            Opcode::Drop => 1,
-            Opcode::Native { .. } => 4,
-            Opcode::Enter { skip, .. } => 5 + *skip as usize,
-            Opcode::Leave { .. } => 3,
-            Opcode::Load => 1,
-            Opcode::Store => 1,
-            Opcode::StoreRev => 1,
-            Opcode::LoadN => 1,
-            Opcode::StoreN => 1,
-            Opcode::ArrayU8 { .. } => 2,
-            Opcode::ArrayU8Load { .. } => 2,
-            Opcode::ArrayU8Store { .. } => 2,
-            Opcode::LocalU8 { .. } => 2,
-            Opcode::LocalU8Load { .. } => 2,
-            Opcode::LocalU8Store { .. } => 2,
-            Opcode::StaticU8 { .. } => 2,
-            Opcode::StaticU8Load { .. } => 2,
-            Opcode::StaticU8Store { .. } => 2,
-            Opcode::IaddU8 { .. } => 2,
-            Opcode::ImulU8 { .. } => 2,
-            Opcode::Ioffset => 1,
-            Opcode::IoffsetU8 { .. } => 2,
-            Opcode::IoffsetU8Load { .. } => 2,
-            Opcode::IoffsetU8Store { .. } => 2,
-            Opcode::PushConstS16 { .. } => 3,
-            Opcode::IaddS16 { .. } => 3,
-            Opcode::ImulS16 { .. } => 3,
-            Opcode::IoffsetS16 { .. } => 3,
-            Opcode::IoffsetS16Load { .. } => 3,
-            Opcode::IoffsetS16Store { .. } => 3,
-            Opcode::ArrayU16 { .. } => 3,
-            Opcode::ArrayU16Load { .. } => 3,
-            Opcode::ArrayU16Store { .. } => 3,
-            Opcode::LocalU16 { .. } => 3,
-            Opcode::LocalU16Load { .. } => 3,
-            Opcode::LocalU16Store { .. } => 3,
-            Opcode::StaticU16 { .. } => 3,
-            Opcode::StaticU16Load { .. } => 3,
-            Opcode::StaticU16Store { .. } => 3,
-            Opcode::GlobalU16 { .. } => 3,
-            Opcode::GlobalU16Load { .. } => 3,
-            Opcode::GlobalU16Store { .. } => 3,
-            Opcode::J { .. } => 3,
-            Opcode::Jz { .. } => 3,
-            Opcode::IEqJz { .. } => 3,
-            Opcode::INeJz { .. } => 3,
-            Opcode::IGtJz { .. } => 3,
-            Opcode::IGeJz { .. } => 3,
-            Opcode::ILtJz { .. } => 3,
-            Opcode::ILeJz { .. } => 3,
-            Opcode::Call { .. } => 4,
-            Opcode::LocalU24 { .. } => 4,
-            Opcode::LocalU24Load { .. } => 4,
-            Opcode::LocalU24Store { .. } => 4,
-            Opcode::GlobalU24 { .. } => 4,
-            Opcode::GlobalU24Load { .. } => 4,
-            Opcode::GlobalU24Store { .. } => 4,
-            Opcode::PushConstU24 { .. } => 4,
-            Opcode::Switch { num_of_entries, .. } => *num_of_entries as usize * 6 + 2,
-            Opcode::String { .. } => 1,
-            Opcode::StringHash => 1,
-            Opcode::TextLabelAssignString { .. } => 2,
-            Opcode::TextLabelAssignInt { .. } => 2,
-            Opcode::TextLabelAppendString { .. } => 2,
-            Opcode::TextLabelAppendInt { .. } => 2,
-            Opcode::TextLabelCopy => 1,
-            Opcode::Catch => 1,
-            Opcode::Throw => 1,
-            Opcode::CallIndirect => 1,
-            Opcode::PushConstM1 => 1,
-            Opcode::PushConst0 => 1,
-            Opcode::PushConst1 => 1,
-            Opcode::PushConst2 => 1,
-            Opcode::PushConst3 => 1,
-            Opcode::PushConst4 => 1,
-            Opcode::PushConst5 => 1,
-            Opcode::PushConst6 => 1,
-            Opcode::PushConst7 => 1,
-            Opcode::PushConstFM1 => 1,
-            Opcode::PushConstF0 => 1,
-            Opcode::PushConstF1 => 1,
-            Opcode::PushConstF2 => 1,
-            Opcode::PushConstF3 => 1,
-            Opcode::PushConstF4 => 1,
-            Opcode::PushConstF5 => 1,
-            Opcode::PushConstF6 => 1,
-            Opcode::PushConstF7 => 1,
-            Opcode::IsBitSet => 1,
+            Instruction::Nop => 1,
+            Instruction::Iadd => 1,
+            Instruction::Isub => 1,
+            Instruction::Imul => 1,
+            Instruction::Idiv => 1,
+            Instruction::Imod => 1,
+            Instruction::Inot => 1,
+            Instruction::Ineg => 1,
+            Instruction::Ieq => 1,
+            Instruction::Ine => 1,
+            Instruction::Igt => 1,
+            Instruction::Ige => 1,
+            Instruction::Ilt => 1,
+            Instruction::Ile => 1,
+            Instruction::Fadd => 1,
+            Instruction::Fsub => 1,
+            Instruction::Fmul => 1,
+            Instruction::Fdiv => 1,
+            Instruction::Fmod => 1,
+            Instruction::Fneg => 1,
+            Instruction::Feq => 1,
+            Instruction::Fne => 1,
+            Instruction::Fgt => 1,
+            Instruction::Fge => 1,
+            Instruction::Flt => 1,
+            Instruction::Fle => 1,
+            Instruction::Vadd => 1,
+            Instruction::Vsub => 1,
+            Instruction::Vmul => 1,
+            Instruction::Vdiv => 1,
+            Instruction::Vneg => 1,
+            Instruction::Iand => 1,
+            Instruction::Ior => 1,
+            Instruction::Ixor => 1,
+            Instruction::I2f => 1,
+            Instruction::F2i => 1,
+            Instruction::F2v => 1,
+            Instruction::PushConstU8 { .. } => 2,
+            Instruction::PushConstU8U8 { .. } => 3,
+            Instruction::PushConstU8U8U8 { .. } => 4,
+            Instruction::PushConstU32 { .. } => 5,
+            Instruction::PushConstF { .. } => 5,
+            Instruction::Dup => 1,
+            Instruction::Drop => 1,
+            Instruction::Native { .. } => 4,
+            Instruction::Enter { skip, .. } => 5 + *skip as usize,
+            Instruction::Leave { .. } => 3,
+            Instruction::Load => 1,
+            Instruction::Store => 1,
+            Instruction::StoreRev => 1,
+            Instruction::LoadN => 1,
+            Instruction::StoreN => 1,
+            Instruction::ArrayU8 { .. } => 2,
+            Instruction::ArrayU8Load { .. } => 2,
+            Instruction::ArrayU8Store { .. } => 2,
+            Instruction::LocalU8 { .. } => 2,
+            Instruction::LocalU8Load { .. } => 2,
+            Instruction::LocalU8Store { .. } => 2,
+            Instruction::StaticU8 { .. } => 2,
+            Instruction::StaticU8Load { .. } => 2,
+            Instruction::StaticU8Store { .. } => 2,
+            Instruction::IaddU8 { .. } => 2,
+            Instruction::ImulU8 { .. } => 2,
+            Instruction::Ioffset => 1,
+            Instruction::IoffsetU8 { .. } => 2,
+            Instruction::IoffsetU8Load { .. } => 2,
+            Instruction::IoffsetU8Store { .. } => 2,
+            Instruction::PushConstS16 { .. } => 3,
+            Instruction::IaddS16 { .. } => 3,
+            Instruction::ImulS16 { .. } => 3,
+            Instruction::IoffsetS16 { .. } => 3,
+            Instruction::IoffsetS16Load { .. } => 3,
+            Instruction::IoffsetS16Store { .. } => 3,
+            Instruction::ArrayU16 { .. } => 3,
+            Instruction::ArrayU16Load { .. } => 3,
+            Instruction::ArrayU16Store { .. } => 3,
+            Instruction::LocalU16 { .. } => 3,
+            Instruction::LocalU16Load { .. } => 3,
+            Instruction::LocalU16Store { .. } => 3,
+            Instruction::StaticU16 { .. } => 3,
+            Instruction::StaticU16Load { .. } => 3,
+            Instruction::StaticU16Store { .. } => 3,
+            Instruction::GlobalU16 { .. } => 3,
+            Instruction::GlobalU16Load { .. } => 3,
+            Instruction::GlobalU16Store { .. } => 3,
+            Instruction::J { .. } => 3,
+            Instruction::Jz { .. } => 3,
+            Instruction::IEqJz { .. } => 3,
+            Instruction::INeJz { .. } => 3,
+            Instruction::IGtJz { .. } => 3,
+            Instruction::IGeJz { .. } => 3,
+            Instruction::ILtJz { .. } => 3,
+            Instruction::ILeJz { .. } => 3,
+            Instruction::Call { .. } => 4,
+            Instruction::LocalU24 { .. } => 4,
+            Instruction::LocalU24Load { .. } => 4,
+            Instruction::LocalU24Store { .. } => 4,
+            Instruction::GlobalU24 { .. } => 4,
+            Instruction::GlobalU24Load { .. } => 4,
+            Instruction::GlobalU24Store { .. } => 4,
+            Instruction::PushConstU24 { .. } => 4,
+            Instruction::Switch { num_of_entries, .. } => *num_of_entries as usize * 6 + 2,
+            Instruction::String { .. } => 1,
+            Instruction::StringHash => 1,
+            Instruction::TextLabelAssignString { .. } => 2,
+            Instruction::TextLabelAssignInt { .. } => 2,
+            Instruction::TextLabelAppendString { .. } => 2,
+            Instruction::TextLabelAppendInt { .. } => 2,
+            Instruction::TextLabelCopy => 1,
+            Instruction::Catch => 1,
+            Instruction::Throw => 1,
+            Instruction::CallIndirect => 1,
+            Instruction::PushConstM1 => 1,
+            Instruction::PushConst0 => 1,
+            Instruction::PushConst1 => 1,
+            Instruction::PushConst2 => 1,
+            Instruction::PushConst3 => 1,
+            Instruction::PushConst4 => 1,
+            Instruction::PushConst5 => 1,
+            Instruction::PushConst6 => 1,
+            Instruction::PushConst7 => 1,
+            Instruction::PushConstFM1 => 1,
+            Instruction::PushConstF0 => 1,
+            Instruction::PushConstF1 => 1,
+            Instruction::PushConstF2 => 1,
+            Instruction::PushConstF3 => 1,
+            Instruction::PushConstF4 => 1,
+            Instruction::PushConstF5 => 1,
+            Instruction::PushConstF6 => 1,
+            Instruction::PushConstF7 => 1,
+            Instruction::IsBitSet => 1,
+        }
+    }
+
+    /// Returns the number of items the opcode attempts to push to the stack
+    /// Some opcodes (like LoadN) make this not guaranteed to be known
+    /// This does not include the amount of items the instruction pops from the stack as the purpose is to be able to quickly iterate through a function backwards, to see the number of returns
+    pub fn get_stack_size(&self) -> Option<isize> {
+        let val = match &self {
+            Instruction::Nop => 0,
+            Instruction::Iadd => 1,
+            Instruction::Isub => 1,
+            Instruction::Imul => 1,
+            Instruction::Idiv => 1,
+            Instruction::Imod => 1,
+            Instruction::Inot => 1,
+            Instruction::Ineg => 1,
+            Instruction::Ieq => 1,
+            Instruction::Ine => 1,
+            Instruction::Igt => 1,
+            Instruction::Ige => 1,
+            Instruction::Ilt => 1,
+            Instruction::Ile => 1,
+            Instruction::Fadd => 1,
+            Instruction::Fsub => 1,
+            Instruction::Fmul => 1,
+            Instruction::Fdiv => 1,
+            Instruction::Fmod => 1,
+            Instruction::Fneg => 1,
+            Instruction::Feq => 1,
+            Instruction::Fne => 1,
+            Instruction::Fgt => 1,
+            Instruction::Fge => 1,
+            Instruction::Flt => 1,
+            Instruction::Fle => 1,
+            Instruction::Vadd => 3,
+            Instruction::Vsub => 3,
+            Instruction::Vmul => 3,
+            Instruction::Vdiv => 3,
+            Instruction::Vneg => 3,
+            Instruction::Iand => 1,
+            Instruction::Ior => 1,
+            Instruction::Ixor => 1,
+            Instruction::I2f => 1,
+            Instruction::F2i => 1,
+            Instruction::F2v => 1,
+            Instruction::PushConstU8 { .. } => 1,
+            Instruction::PushConstU8U8 { .. } => 2,
+            Instruction::PushConstU8U8U8 { .. } => 3,
+            Instruction::PushConstU32 { .. } => 1,
+            Instruction::PushConstF { .. } => 1,
+            Instruction::Dup => 1,
+            Instruction::Drop => 0,
+            Instruction::Native { num_returns, .. } => *num_returns as isize,
+            Instruction::Enter { .. } => 0,
+            Instruction::Leave { .. } => 0,
+            Instruction::Load => 1,
+            Instruction::Store => 1,
+            Instruction::StoreRev => 1,
+            Instruction::LoadN => 1,
+            Instruction::StoreN => 1,
+            Instruction::ArrayU8 { .. } => 1,
+            Instruction::ArrayU8Load { .. } => 1,
+            Instruction::ArrayU8Store { .. } => 0,
+            Instruction::LocalU8 { .. } => 1,
+            Instruction::LocalU8Load { .. } => 1,
+            Instruction::LocalU8Store { .. } => 0,
+            Instruction::StaticU8 { .. } => 1,
+            Instruction::StaticU8Load { .. } => 1,
+            Instruction::StaticU8Store { .. } => 0,
+            Instruction::IaddU8 { .. } => 1,
+            Instruction::ImulU8 { .. } => 1,
+            Instruction::Ioffset => 1,
+            Instruction::IoffsetU8 { .. } => 1,
+            Instruction::IoffsetU8Load { .. } => 1,
+            Instruction::IoffsetU8Store { .. } => 0,
+            Instruction::PushConstS16 { .. } => 1,
+            Instruction::IaddS16 { .. } => 1,
+            Instruction::ImulS16 { .. } => 1,
+            Instruction::IoffsetS16 { .. } => 1,
+            Instruction::IoffsetS16Load { .. } => 1,
+            Instruction::IoffsetS16Store { .. } => 0,
+            Instruction::ArrayU16 { .. } => 1,
+            Instruction::ArrayU16Load { .. } => 1,
+            Instruction::ArrayU16Store { .. } => 0,
+            Instruction::LocalU16 { .. } => 1,
+            Instruction::LocalU16Load { .. } => 1,
+            Instruction::LocalU16Store { .. } => 0,
+            Instruction::StaticU16 { .. } => 1,
+            Instruction::StaticU16Load { .. } => 1,
+            Instruction::StaticU16Store { .. } => 0,
+            Instruction::GlobalU16 { .. } => 1,
+            Instruction::GlobalU16Load { .. } => 1,
+            Instruction::GlobalU16Store { .. } => 0,
+            Instruction::J { .. } => -1,
+            Instruction::Jz { .. } => -1,
+            Instruction::IEqJz { .. } => -1,
+            Instruction::INeJz { .. } => -1,
+            Instruction::IGtJz { .. } => -1,
+            Instruction::IGeJz { .. } => -1,
+            Instruction::ILtJz { .. } => -1,
+            Instruction::ILeJz { .. } => -1,
+            Instruction::Call { .. } => -1,
+            Instruction::LocalU24 { .. } => 1,
+            Instruction::LocalU24Load { .. } => 1,
+            Instruction::LocalU24Store { .. } => 0,
+            Instruction::GlobalU24 { .. } => 1,
+            Instruction::GlobalU24Load { .. } => 1,
+            Instruction::GlobalU24Store { .. } => 0,
+            Instruction::PushConstU24 { .. } => 1,
+            Instruction::Switch { .. } => -1,
+            Instruction::String { .. } => 1,
+            Instruction::StringHash => 1,
+            Instruction::TextLabelAssignString { .. } => 1,
+            Instruction::TextLabelAssignInt { .. } => 1,
+            Instruction::TextLabelAppendString { .. } => 1,
+            Instruction::TextLabelAppendInt { .. } => 1,
+            Instruction::TextLabelCopy => 1,
+            Instruction::Catch => -1,
+            Instruction::Throw => -1,
+            Instruction::CallIndirect => -1,
+            Instruction::PushConstM1 => 1,
+            Instruction::PushConst0 => 1,
+            Instruction::PushConst1 => 1,
+            Instruction::PushConst2 => 1,
+            Instruction::PushConst3 => 1,
+            Instruction::PushConst4 => 1,
+            Instruction::PushConst5 => 1,
+            Instruction::PushConst6 => 1,
+            Instruction::PushConst7 => 1,
+            Instruction::PushConstFM1 => 1,
+            Instruction::PushConstF0 => 1,
+            Instruction::PushConstF1 => 1,
+            Instruction::PushConstF2 => 1,
+            Instruction::PushConstF3 => 1,
+            Instruction::PushConstF4 => 1,
+            Instruction::PushConstF5 => 1,
+            Instruction::PushConstF6 => 1,
+            Instruction::PushConstF7 => 1,
+            Instruction::IsBitSet => 1,
+        };
+
+        if val == -1 {
+            None
+        } else {
+            Some(val)
         }
     }
 }
 
+/// Information about a Switch instruction
 #[derive(Debug, Clone)]
 pub struct SwitchEntry {
     index_id: u32,
     jump_offset: u16,
 }
 
+#[allow(missing_docs)]
 #[repr(u8)]
 #[derive(Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
-enum RawOpcode {
+pub enum RawOpcode {
     Nop = 0,
     Iadd,
     Isub,

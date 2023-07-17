@@ -1,14 +1,105 @@
-// CURRENT ISSUE: if statements with multiple conditionals
-
-use crate::disassemble::{Disassembler, Opcode};
+use crate::disassemble::{Disassembler, Instruction, DisassembleError};
 use crate::ysc::YSCScript;
-use anyhow::{anyhow, Context, Error, Result};
 use std::fmt::{Display, Formatter};
+use thiserror::Error;
+
+/// Generic stack error types returned by AstGenerator
+#[derive(Error, Debug)]
+pub enum AstStackError {
+    /// During decompilation, items might be requested from the stack, and the stack might not contain enough items
+    #[error("no more items are in the stack. stack is of size {size:?} and {requested:?} items were requested")]
+    StackEnded {
+        /// Total size of the stack
+        size: Option<usize>,
+        /// However many items were requested from the stack
+        requested: Option<usize>
+    },
+    /// Items on the stack can have a "size" on the stack which is greater than one.
+    /// You can push a Vec3 to the stack, it'll be one stack item, but it'll have the size of 3
+    /// Under certain conditions, trying to aquire less elements then the size of the current element can result in an error
+    #[error("attempt to pop item off the stack that does not meet proper stack boundaries ({remaining} remaining)")]
+    StackMisaligned {
+        /// How many items are left in the stack
+        remaining: usize,
+    }
+}
+
+/// Generic error types returned by AstGenerator
+#[derive(Error, Debug)]
+pub enum AstError {
+    /// Errors pertaining to the stack
+    #[error("stack error")]
+    StackError(#[from] AstStackError),
+
+    /// Errors pertaining to the disassembly of a script
+    #[error("disassemble error")]
+    DisassembleError(#[from] DisassembleError),
+
+    /// Attempt to perform actions on a function index which doesn't exist
+    #[error("specified function index {index} is larger than count {count}")]
+    BadFunctionIndex {
+        /// Specified function index
+        index: usize,
+
+        /// Number of functions
+        count: usize
+    },
+
+    /// Blocks can be thought of the group of expressions within if/else/while etc.. blocks
+    /// If a child block inside another block references code outside of its parent block, this could trigger
+    /// Note that specific hotfixes are applied for very common cases where this might happen
+    #[error("invalid block size")]
+    InvalidBlockSize,
+
+    /// The disassembler runs a two-stage pass on the code
+    /// - It first generates a list of all the functions and their locations
+    /// - Then it finds CALL instructions and determines which exact function they're calling
+    /// This can fail if the disassembler didn't get to disassemble the entire script and you call a later function
+    #[error("call instruction tried to call a non-existent function")]
+    NoCallIndex,
+
+    /// If we must disassemble a function to determine how many arguments it returns, and that function calls its-self recursively too many times, we have to fail
+    #[error("function {index} repeatedly calls its-self")]
+    RecursionLimit {
+        /// The function that attempted to be called
+        index: usize
+    },
+    /// Certain instructions push or pop an undetermined number of arguments from the stack, this makes attempts at static decompilation hard
+    #[error("instruction {opcode:#?} called with non-const size")]
+    DynamicStackSize {
+        /// Opcode that is dynamic
+        opcode: Instruction
+    },
+    /// AST generator found an opcode that it didn't support
+    #[error("unsupported opcode {opcode:#?}")]
+    UnsupportedOpcode {
+        /// Opcode that is unsupported
+        opcode: Instruction
+    }
+}
+
+/// A function that has not been decompiled, contains just enough information to be decompiled
 #[derive(Debug, Clone)]
-pub struct Function {
+pub struct ProtoFunction {
     num_args: u8,
     index: usize,
-    instructions: Vec<Opcode>,
+    instructions: Vec<Instruction>,
+}
+
+impl ProtoFunction {
+    fn get_func(&self) -> Function {
+        Function::new(&self.instructions, self.index, AstStack::new(), 0, Vars::default())
+    }
+}
+
+/// A fully decompiled function
+#[derive(Debug)]
+pub struct AstFunction {
+    body: Ast,
+    num_args: u8,
+    num_returns: u8,
+    index: usize,
+    vars: Vars,
 }
 
 #[derive(Debug, Clone)]
@@ -447,15 +538,6 @@ impl Display for Ast {
     }
 }
 
-#[derive(Debug)]
-pub struct AstFunction {
-    body: Ast,
-    num_args: u8,
-    num_returns: u8,
-    index: usize,
-    vars: Vars,
-}
-
 #[derive(Clone)]
 struct AstStack {
     stack: Vec<Ast>,
@@ -479,11 +561,12 @@ impl AstStack {
         statements: &mut Vec<Ast>,
         temp_vars_count: &mut u8,
         size: u32,
-    ) -> Result<Vec<Ast>, Error> {
+    ) -> Result<Vec<Ast>, AstStackError> {
         if size == 0 {
             return Ok(vec![]);
         }
         let og_size = size;
+        let total_stack_size = self.stack.len();
         let mut size_remaining: i64 = size as i64;
         let mut items: Vec<Ast> = Vec::with_capacity(size as usize);
 
@@ -495,12 +578,12 @@ impl AstStack {
                 items.push(
                     self.stack
                         .pop()
-                        .ok_or(anyhow!("Cannot pop stack further"))?,
+                        .ok_or(AstStackError::StackEnded { size: Some(total_stack_size), requested: Some(og_size as usize) })?,
                 );
             }
             match size_remaining {
                 size_remaining if size_remaining < 0 => {
-                    return Err(anyhow!("(Stack overflow). make `Sized` (to reduce a large elements size) and `StackFieldReference` (to reference a single element in a large element) AST type"));
+                    return Err(AstStackError::StackMisaligned { remaining: size_remaining as usize });
                 }
                 size_remaining if size_remaining == 0 => {
                     return if items.len() == 1 && og_size == 1 && items[0].get_stack_size() == 1 {
@@ -544,7 +627,7 @@ impl AstStack {
             }
         }
 
-        Err(anyhow!("empty stack"))
+        Err(AstStackError::StackEnded { size: Some(og_size as usize), requested: Some(total_stack_size) })
     }
 
     fn len(&self) -> usize {
@@ -562,17 +645,17 @@ struct Vars {
     temp: u8,
 }
 
-struct ProtoFunction<'a> {
-    instructions: &'a [Opcode],
+struct Function<'a> {
+    instructions: &'a [Instruction],
     function_index: usize,
     stack: AstStack,
     depth: usize,
     vars: Vars,
 }
 
-impl<'a> ProtoFunction<'a> {
+impl<'a> Function<'a> {
     fn new(
-        instructions: &'a [Opcode],
+        instructions: &'a [Instruction],
         function_index: usize,
         stack: AstStack,
         depth: usize,
@@ -588,20 +671,25 @@ impl<'a> ProtoFunction<'a> {
     }
 }
 
+/// Creates Functions and turns them into AstFunctions
+/// Can be created from a YSCScript 
 pub struct AstGenerator {
-    functions: Vec<Function>,
+    functions: Vec<ProtoFunction>,
 }
 
 impl AstGenerator {
-    pub fn generate_function(&self, index: usize) -> Result<AstFunction, Error> {
+    /// Try to generate AST for a function given it's index
+    pub fn generate_function(&self, index: usize) -> Result<AstFunction, AstError> {
         self.generate_function_with_stack(index, AstStack::new(), 0)
     }
 
-    pub fn get_functions(&self) -> &Vec<Function> {
+    /// Get a list of all the ProtoFunctions that AstGenerator can access
+    pub fn get_functions(&self) -> &Vec<ProtoFunction> {
         &self.functions
     }
 
-    pub fn get_functions_mut(&mut self) -> &mut Vec<Function> {
+    /// Get a list of all the ProtoFunctions that AstGenerator can access
+    pub fn get_functions_mut(&mut self) -> &mut Vec<ProtoFunction> {
         &mut self.functions
     }
 
@@ -610,12 +698,10 @@ impl AstGenerator {
         index: usize,
         stack: AstStack,
         depth: usize,
-    ) -> Result<AstFunction, Error> {
+    ) -> Result<AstFunction, AstError> {
     
         if index >= self.functions.len() {
-            return Err(anyhow!(
-                "Specified function index is larger than function count"
-            ));
+            return Err(AstError::BadFunctionIndex { index, count: self.functions.len() });
         }
 
         let ast_func = self.generate_ast_from_function(&self.functions[index], stack, depth)?;
@@ -624,11 +710,11 @@ impl AstGenerator {
 
     fn generate_ast_from_function(
         &self,
-        function: &Function,
+        function: &ProtoFunction,
         stack: AstStack,
         depth: usize,
-    ) -> Result<AstFunction, Error> {
-        let (body, num_returns, vars) = self.generate_ast(&mut ProtoFunction::new(
+    ) -> Result<AstFunction, AstError> {
+        let (body, num_returns, vars) = self.generate_ast(&mut Function::new(
             &function.instructions[1..],
             function.index,
             stack,
@@ -650,14 +736,14 @@ impl AstGenerator {
     fn generate_conditional_block<'b>(
         index: &mut usize,
         offset_remaining: i16,
-        instructions: &'b [Opcode],
-    ) -> Option<&'b [Opcode]> {
+        instructions: &'b [Instruction],
+    ) -> Option<&'b [Instruction]> {
         *index += 1;
         let og_index = *index;
 
         fn find_offset(
             mut offset_remaining: i16,
-            instructions: &[Opcode],
+            instructions: &[Instruction],
             mut index: usize,
         ) -> Option<usize> {
             while offset_remaining > 0 {
@@ -667,28 +753,28 @@ impl AstGenerator {
                 let inst = &instructions[index];
                 offset_remaining -= inst.get_size() as i16; // todo: this might be too small when factoring large switches
                 match inst {
-                    Opcode::Jz { offset } => {
+                    Instruction::Jz { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
-                    Opcode::ILtJz { offset } => {
+                    Instruction::ILtJz { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
-                    Opcode::ILeJz { offset } => {
+                    Instruction::ILeJz { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
-                    Opcode::INeJz { offset } => {
+                    Instruction::INeJz { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
-                    Opcode::IEqJz { offset } => {
+                    Instruction::IEqJz { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
-                    Opcode::IGtJz { offset } => {
+                    Instruction::IGtJz { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
-                    Opcode::IGeJz { offset } => {
+                    Instruction::IGeJz { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
-                    Opcode::J { offset } => {
+                    Instruction::J { offset } => {
                         offset_remaining = std::cmp::max(*offset, offset_remaining);
                     }
                     _ => {}
@@ -716,34 +802,34 @@ impl AstGenerator {
         offset_remaining: i16,
         index: &mut usize,
         statements: &mut Vec<Ast>,
-        proto: &mut ProtoFunction,
-    ) -> Result<()> {
+        func: &mut Function,
+    ) -> Result<(), AstError> {
         if offset_remaining == 0 {
             return Ok(());
         }
 
         let mut instructions_in_block =
-            AstGenerator::generate_conditional_block(index, offset_remaining, proto.instructions)
-                .context("Invalid block size: {}")?;
+            AstGenerator::generate_conditional_block(index, offset_remaining, func.instructions)
+                .ok_or(AstError::InvalidBlockSize)?;
         let mut is_while = false;
         let else_ = if !instructions_in_block.is_empty() {
             let inst = instructions_in_block.last().unwrap();
-            if let Opcode::J { offset } = inst {
+            if let Instruction::J { offset } = inst {
                 if *offset > 0 {
                     instructions_in_block =
                         &instructions_in_block[..(instructions_in_block.len() - 1)];
                     let offset = *offset;
                     let else_block =
-                        AstGenerator::generate_conditional_block(index, offset, proto.instructions)
-                            .ok_or(anyhow!("Invalid block size"))?;
+                        AstGenerator::generate_conditional_block(index, offset, func.instructions)
+                            .ok_or(AstError::InvalidBlockSize)?;
 
                     Some(Box::new(
-                        self.generate_ast(&mut ProtoFunction::new(
+                        self.generate_ast(&mut Function::new(
                             else_block,
-                            proto.function_index,
-                            proto.stack.clone(),
-                            proto.depth,
-                            proto.vars.clone(),
+                            func.function_index,
+                            func.stack.clone(),
+                            func.depth,
+                            func.vars.clone(),
                         ))?
                         .0,
                     ))
@@ -765,12 +851,12 @@ impl AstGenerator {
             Ast::While {
                 condition,
                 body: Box::new(
-                    self.generate_ast(&mut ProtoFunction::new(
+                    self.generate_ast(&mut Function::new(
                         instructions_in_block,
-                        proto.function_index,
-                        proto.stack.clone(),
-                        proto.depth,
-                        proto.vars.clone(),
+                        func.function_index,
+                        func.stack.clone(),
+                        func.depth,
+                        func.vars.clone(),
                     ))?
                     .0,
                 ),
@@ -779,12 +865,12 @@ impl AstGenerator {
             Ast::If {
                 condition,
                 body: Box::new(
-                    self.generate_ast(&mut ProtoFunction::new(
+                    self.generate_ast(&mut Function::new(
                         instructions_in_block,
-                        proto.function_index,
-                        proto.stack.clone(),
-                        proto.depth,
-                        proto.vars.clone(),
+                        func.function_index,
+                        func.stack.clone(),
+                        func.depth,
+                        func.vars.clone(),
                     ))?
                     .0,
                 ),
@@ -792,20 +878,20 @@ impl AstGenerator {
             }
         };
         statements.push(if_);
-        anyhow::Ok(())
+        Ok(())
     }
 
-    fn generate_ast(&self, proto: &mut ProtoFunction) -> Result<(Ast, u8, Vars), Error> {
+    fn generate_ast(&self, func: &mut Function) -> Result<(Ast, u8, Vars), AstError> {
         let mut index = 0;
         let mut statements = Vec::with_capacity(8);
         let mut returns = 0;
 
-        fn err() -> anyhow::Error {
-            anyhow!("Invalid stack item")
+        fn err() -> AstError {
+            AstError::StackError(AstStackError::StackEnded { size: None, requested: None })
         }
 
-        while index < proto.instructions.len() {
-            let inst = &proto.instructions[index];
+        while index < func.instructions.len() {
+            let inst = &func.instructions[index];
 
             // let list = Ast::StatementList {
             //     list: statements.clone(),
@@ -819,286 +905,286 @@ impl AstGenerator {
             // println!("ITER:\n{list}\n\n");
 
             match inst {
-                Opcode::PushConstM1 => {
-                    proto.stack.push(Ast::ConstInt { val: -1 });
+                Instruction::PushConstM1 => {
+                    func.stack.push(Ast::ConstInt { val: -1 });
                 }
-                Opcode::PushConst0 => {
-                    proto.stack.push(Ast::ConstInt { val: 0 });
+                Instruction::PushConst0 => {
+                    func.stack.push(Ast::ConstInt { val: 0 });
                 }
-                Opcode::PushConst1 => {
-                    proto.stack.push(Ast::ConstInt { val: 1 });
+                Instruction::PushConst1 => {
+                    func.stack.push(Ast::ConstInt { val: 1 });
                 }
-                Opcode::PushConst2 => {
-                    proto.stack.push(Ast::ConstInt { val: 2 });
+                Instruction::PushConst2 => {
+                    func.stack.push(Ast::ConstInt { val: 2 });
                 }
-                Opcode::PushConst3 => {
-                    proto.stack.push(Ast::ConstInt { val: 3 });
+                Instruction::PushConst3 => {
+                    func.stack.push(Ast::ConstInt { val: 3 });
                 }
-                Opcode::PushConst4 => {
-                    proto.stack.push(Ast::ConstInt { val: 4 });
+                Instruction::PushConst4 => {
+                    func.stack.push(Ast::ConstInt { val: 4 });
                 }
-                Opcode::PushConst5 => {
-                    proto.stack.push(Ast::ConstInt { val: 5 });
+                Instruction::PushConst5 => {
+                    func.stack.push(Ast::ConstInt { val: 5 });
                 }
-                Opcode::PushConst6 => {
-                    proto.stack.push(Ast::ConstInt { val: 6 });
+                Instruction::PushConst6 => {
+                    func.stack.push(Ast::ConstInt { val: 6 });
                 }
-                Opcode::PushConst7 => {
-                    proto.stack.push(Ast::ConstInt { val: 7 });
+                Instruction::PushConst7 => {
+                    func.stack.push(Ast::ConstInt { val: 7 });
                 }
-                Opcode::PushConstU8 { one } => {
-                    proto.stack.push(Ast::ConstInt { val: *one as i32 });
+                Instruction::PushConstU8 { one } => {
+                    func.stack.push(Ast::ConstInt { val: *one as i32 });
                 }
-                Opcode::PushConstS16 { num } => {
-                    proto.stack.push(Ast::ConstInt { val: *num as i32 });
+                Instruction::PushConstS16 { num } => {
+                    func.stack.push(Ast::ConstInt { val: *num as i32 });
                 }
-                Opcode::PushConstF { one } => {
-                    proto.stack.push(Ast::ConstFloat { val: *one });
+                Instruction::PushConstF { one } => {
+                    func.stack.push(Ast::ConstFloat { val: *one });
                 }
-                Opcode::PushConstF0 => {
-                    proto.stack.push(Ast::ConstFloat { val: 0.0 });
+                Instruction::PushConstF0 => {
+                    func.stack.push(Ast::ConstFloat { val: 0.0 });
                 }
-                Opcode::PushConstF1 => {
-                    proto.stack.push(Ast::ConstFloat { val: 1.0 });
+                Instruction::PushConstF1 => {
+                    func.stack.push(Ast::ConstFloat { val: 1.0 });
                 }
-                Opcode::PushConstF2 => {
-                    proto.stack.push(Ast::ConstFloat { val: 2.0 });
+                Instruction::PushConstF2 => {
+                    func.stack.push(Ast::ConstFloat { val: 2.0 });
                 }
-                Opcode::PushConstF3 => {
-                    proto.stack.push(Ast::ConstFloat { val: 3.0 });
+                Instruction::PushConstF3 => {
+                    func.stack.push(Ast::ConstFloat { val: 3.0 });
                 }
-                Opcode::PushConstF4 => {
-                    proto.stack.push(Ast::ConstFloat { val: 4.0 });
+                Instruction::PushConstF4 => {
+                    func.stack.push(Ast::ConstFloat { val: 4.0 });
                 }
-                Opcode::PushConstF5 => {
-                    proto.stack.push(Ast::ConstFloat { val: 5.0 });
+                Instruction::PushConstF5 => {
+                    func.stack.push(Ast::ConstFloat { val: 5.0 });
                 }
-                Opcode::PushConstF6 => {
-                    proto.stack.push(Ast::ConstFloat { val: 6.0 });
+                Instruction::PushConstF6 => {
+                    func.stack.push(Ast::ConstFloat { val: 6.0 });
                 }
-                Opcode::PushConstF7 => {
-                    proto.stack.push(Ast::ConstFloat { val: 7.0 });
+                Instruction::PushConstF7 => {
+                    func.stack.push(Ast::ConstFloat { val: 7.0 });
                 }
-                Opcode::PushConstFM1 => {
-                    proto.stack.push(Ast::ConstFloat { val: -1.0 });
+                Instruction::PushConstFM1 => {
+                    func.stack.push(Ast::ConstFloat { val: -1.0 });
                 }
-                Opcode::PushConstU32 { one } => {
-                    proto.stack.push(Ast::ConstInt { val: *one as i32 });
+                Instruction::PushConstU32 { one } => {
+                    func.stack.push(Ast::ConstInt { val: *one as i32 });
                 }
-                Opcode::PushConstU24 { num } => {
-                    proto.stack.push(Ast::ConstInt { val: *num as i32 });
+                Instruction::PushConstU24 { num } => {
+                    func.stack.push(Ast::ConstInt { val: *num as i32 });
                 }
-                Opcode::Throw => {
-                    proto.stack.push(Ast::ConstInt { val: 0 });
+                Instruction::Throw => {
+                    func.stack.push(Ast::ConstInt { val: 0 });
                 }
-                Opcode::Nop => {}
-                Opcode::Ilt => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Nop => {}
+                Instruction::Ilt => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntLessThan {
+                    func.stack.push(Ast::IntLessThan {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Ile => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Ile => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntLessThanOrEq {
+                    func.stack.push(Ast::IntLessThanOrEq {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Igt => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Igt => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntGreaterThan {
+                    func.stack.push(Ast::IntGreaterThan {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Ige => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Ige => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntGreaterThanOrEq {
+                    func.stack.push(Ast::IntGreaterThanOrEq {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Flt => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Flt => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatLessThan {
+                    func.stack.push(Ast::FloatLessThan {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Fgt => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Fgt => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatGreaterThan {
+                    func.stack.push(Ast::FloatGreaterThan {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Fle => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Fle => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatLessThanOrEq {
+                    func.stack.push(Ast::FloatLessThanOrEq {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Fge => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Fge => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatGreaterThanOrEq {
+                    func.stack.push(Ast::FloatGreaterThanOrEq {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Ior => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Ior => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
 
-                    proto.stack.push(Ast::IntegerOr {
+                    func.stack.push(Ast::IntegerOr {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Iand => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Iand => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntegerAnd {
+                    func.stack.push(Ast::IntegerAnd {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Iadd => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Iadd => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntAdd {
+                    func.stack.push(Ast::IntAdd {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Imul => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Imul => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntMul {
+                    func.stack.push(Ast::IntMul {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::ImulU8 { num } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 1)?;
+                Instruction::ImulU8 { num } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 1)?;
                     let lhs = args.pop().ok_or(err())?;
-                    proto.stack.push(Ast::IntMul {
+                    func.stack.push(Ast::IntMul {
                         lhs: Box::new(lhs),
                         rhs: Box::new(Ast::ConstInt { val: *num as i32 }),
                     });
                 }
-                Opcode::ImulS16 { num } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 1)?;
+                Instruction::ImulS16 { num } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 1)?;
                     let lhs = args.pop().ok_or(err())?;
-                    proto.stack.push(Ast::IntMul {
+                    func.stack.push(Ast::IntMul {
                         lhs: Box::new(lhs),
                         rhs: Box::new(Ast::ConstInt { val: *num as i32 }),
                     });
                 }
-                Opcode::Fmul => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Fmul => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatMul {
+                    func.stack.push(Ast::FloatMul {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::IaddS16 { num } => {
-                    let arg = proto
+                Instruction::IaddS16 { num } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
-                    proto.stack.push(Ast::IntAdd {
+                    func.stack.push(Ast::IntAdd {
                         lhs: Box::new(arg),
                         rhs: Box::new(Ast::ConstInt { val: *num as i32 }),
                     });
                 }
-                Opcode::IaddU8 { num } => {
-                    let arg = proto
+                Instruction::IaddU8 { num } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
-                    proto.stack.push(Ast::IntAdd {
+                    func.stack.push(Ast::IntAdd {
                         lhs: Box::new(arg),
                         rhs: Box::new(Ast::ConstInt { val: *num as i32 }),
                     });
                 }
-                Opcode::Isub => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Isub => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntSub {
+                    func.stack.push(Ast::IntSub {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Fsub => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Fsub => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatSub {
+                    func.stack.push(Ast::FloatSub {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Idiv => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Idiv => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntDiv {
+                    func.stack.push(Ast::IntDiv {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Imod => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Imod => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntMod {
+                    func.stack.push(Ast::IntMod {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Fdiv => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Fdiv => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatDiv {
+                    func.stack.push(Ast::FloatDiv {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Fadd => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Fadd => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatAdd {
+                    func.stack.push(Ast::FloatAdd {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::StaticU16Load { static_var_index } => {
-                    proto.stack.push(Ast::Static {
+                Instruction::StaticU16Load { static_var_index } => {
+                    func.stack.push(Ast::Static {
                         index: *static_var_index as u32,
                     });
                 }
-                Opcode::StaticU16 { static_var_index } => {
-                    proto.stack.push(Ast::Reference {
+                Instruction::StaticU16 { static_var_index } => {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Static {
                             index: *static_var_index as u32,
                         }),
                     });
                 }
-                Opcode::StaticU16Store { static_var_index } => {
-                    let arg = proto
+                Instruction::StaticU16Store { static_var_index } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     statements.push(Ast::Store {
@@ -1106,26 +1192,26 @@ impl AstGenerator {
                         rhs: Box::new(arg),
                     });
                 }
-                Opcode::GlobalU16 { index } => {
-                    proto.stack.push(Ast::Reference {
+                Instruction::GlobalU16 { index } => {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Global {
                             index: *index as u32,
                         }),
                     });
                 }
-                Opcode::GlobalU24 { index } => {
-                    proto.stack.push(Ast::Reference {
+                Instruction::GlobalU24 { index } => {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Global { index: *index }),
                     });
                 }
-                Opcode::ArrayU8 { size } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::ArrayU8 { size } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
                         _ => Box::new(ptr),
                     };
-                    proto.stack.push(Ast::Reference {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Array {
                             var: ptr,
                             at: Box::new(index),
@@ -1133,27 +1219,27 @@ impl AstGenerator {
                         }),
                     })
                 }
-                Opcode::ArrayU8Load { size } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::ArrayU8Load { size } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
                         _ => Box::new(ptr),
                     };
-                    proto.stack.push(Ast::Array {
+                    func.stack.push(Ast::Array {
                         var: ptr,
                         at: Box::new(index),
                         size: *size as u32,
                     })
                 }
-                Opcode::ArrayU16 { size } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::ArrayU16 { size } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
                         _ => Box::new(ptr),
                     };
-                    proto.stack.push(Ast::Reference {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Array {
                             var: ptr,
                             at: Box::new(index),
@@ -1161,47 +1247,47 @@ impl AstGenerator {
                         }),
                     })
                 }
-                Opcode::ArrayU16Load { size } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::ArrayU16Load { size } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (index, ptr) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let ptr = match ptr {
                         Ast::Reference { val } => val,
                         _ => Box::new(ptr),
                     };
-                    proto.stack.push(Ast::Array {
+                    func.stack.push(Ast::Array {
                         var: ptr,
                         at: Box::new(index),
                         size: *size as u32,
                     })
                 }
 
-                Opcode::LocalU8 { frame_index } => {
+                Instruction::LocalU8 { frame_index } => {
                     self.register_local_var(
-                        proto.function_index,
+                        func.function_index,
                         *frame_index,
-                        &mut proto.vars.local,
+                        &mut func.vars.local,
                     );
-                    let num_args = self.functions[proto.function_index].num_args;
+                    let num_args = self.functions[func.function_index].num_args;
 
                     let local_var_index = if *frame_index > num_args {
                         Some(*frame_index as u32 - num_args as u32 - 1)
                     } else {
                         None
                     };
-                    proto.stack.push(Ast::Reference {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Local {
                             index: *frame_index,
                             local_var_index,
                         }),
                     });
                 }
-                Opcode::LocalU8Load { frame_index } => {
+                Instruction::LocalU8Load { frame_index } => {
                     self.register_local_var(
-                        proto.function_index,
+                        func.function_index,
                         *frame_index,
-                        &mut proto.vars.local,
+                        &mut func.vars.local,
                     );
-                    let num_args = self.functions[proto.function_index].num_args;
+                    let num_args = self.functions[func.function_index].num_args;
 
                     let local_var_index = if *frame_index > num_args {
                         Some(*frame_index as u32 - num_args as u32 - 1)
@@ -1209,27 +1295,27 @@ impl AstGenerator {
                         None
                     };
 
-                    proto.stack.push(Ast::Local {
+                    func.stack.push(Ast::Local {
                         index: *frame_index,
                         local_var_index,
                     });
                 }
-                Opcode::LocalU8Store { frame_index } => {
+                Instruction::LocalU8Store { frame_index } => {
                     self.register_local_var(
-                        proto.function_index,
+                        func.function_index,
                         *frame_index,
-                        &mut proto.vars.local,
+                        &mut func.vars.local,
                     );
-                    let num_args = self.functions[proto.function_index].num_args;
+                    let num_args = self.functions[func.function_index].num_args;
 
                     let local_var_index = if *frame_index > num_args {
                         Some(*frame_index as u32 - num_args as u32 - 1)
                     } else {
                         None
                     };
-                    let arg = proto
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
@@ -1241,10 +1327,10 @@ impl AstGenerator {
                         rhs: Box::new(arg),
                     });
                 }
-                Opcode::GlobalU24Store { index } => {
-                    let arg = proto
+                Instruction::GlobalU24Store { index } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     statements.push(Ast::Store {
@@ -1252,10 +1338,10 @@ impl AstGenerator {
                         rhs: Box::new(arg),
                     });
                 }
-                Opcode::GlobalU16Store { index } => {
-                    let arg = proto
+                Instruction::GlobalU16Store { index } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     statements.push(Ast::Store {
@@ -1265,16 +1351,16 @@ impl AstGenerator {
                         rhs: Box::new(arg),
                     });
                 }
-                Opcode::GlobalU16Load { index } => {
-                    proto.stack.push(Ast::Global {
+                Instruction::GlobalU16Load { index } => {
+                    func.stack.push(Ast::Global {
                         index: *index as u32,
                     });
                 }
-                Opcode::GlobalU24Load { index } => {
-                    proto.stack.push(Ast::Global { index: *index });
+                Instruction::GlobalU24Load { index } => {
+                    func.stack.push(Ast::Global { index: *index });
                 }
-                Opcode::IoffsetU8Store { offset } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::IoffsetU8Store { offset } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let rhs = args.pop().ok_or(err())?;
                     let var = args.pop().ok_or(err())?;
 
@@ -1286,38 +1372,38 @@ impl AstGenerator {
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::IoffsetS16 { offset } => {
-                    let arg = proto
+                Instruction::IoffsetS16 { offset } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
-                    proto.stack.push(Ast::Reference {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Offset {
                             var: Box::new(arg),
                             offset: *offset as u32,
                         }),
                     });
                 }
-                Opcode::IoffsetU8 { offset } => {
-                    let arg = proto
+                Instruction::IoffsetU8 { offset } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
-                    proto.stack.push(Ast::Reference {
+                    func.stack.push(Ast::Reference {
                         val: Box::new(Ast::Offset {
                             var: Box::new(arg),
                             offset: *offset as u32,
                         }),
                     });
                 }
-                Opcode::IoffsetU8Load { offset } => {
-                    let arg = proto
+                Instruction::IoffsetU8Load { offset } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
@@ -1326,25 +1412,25 @@ impl AstGenerator {
                     //    _ => Box::new(arg)
                     //};
 
-                    proto.stack.push(Ast::Offset {
+                    func.stack.push(Ast::Offset {
                         var: Box::new(arg),
                         offset: *offset as u32,
                     });
                 }
-                Opcode::IoffsetS16Load { offset } => {
-                    let arg = proto
+                Instruction::IoffsetS16Load { offset } => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
 
-                    proto.stack.push(Ast::Offset {
+                    func.stack.push(Ast::Offset {
                         var: Box::new(arg),
                         offset: *offset as u32,
                     });
                 }
-                Opcode::IoffsetS16Store { offset } => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::IoffsetS16Store { offset } => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let rhs = args.pop().ok_or(err())?;
                     let var = args.pop().ok_or(err())?;
 
@@ -1356,15 +1442,15 @@ impl AstGenerator {
                         rhs: Box::new(rhs),
                     });
                 }
-                Opcode::Leave { .. } => {
-                    if proto.stack.is_empty() {
+                Instruction::Leave { .. } => {
+                    if func.stack.is_empty() {
                         statements.push(Ast::Return { var: None });
                     } else {
-                        let len = proto.stack.len();
+                        let len = func.stack.len();
                         let mut items =
-                            proto
+                            func
                                 .stack
-                                .pop(&mut statements, &mut proto.vars.temp, len as u32)?;
+                                .pop(&mut statements, &mut func.vars.temp, len as u32)?;
 
                         if items.len() == 1 {
                             statements.push(Ast::Return {
@@ -1379,24 +1465,24 @@ impl AstGenerator {
                     }
                     break;
                 }
-                Opcode::IsBitSet => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::IsBitSet => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (bit, val) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IsBitSet {
+                    func.stack.push(Ast::IsBitSet {
                         val: Box::new(val),
                         bit: Box::new(bit),
                     });
                 }
-                Opcode::Native {
+                Instruction::Native {
                     native_hash,
                     num_args,
                     num_returns,
                     ..
                 } => {
                     let mut args_list =
-                        proto
+                        func
                             .stack
-                            .pop(&mut statements, &mut proto.vars.temp, *num_args as u32)?;
+                            .pop(&mut statements, &mut func.vars.temp, *num_args as u32)?;
                     args_list.reverse();
                     let native = Ast::Native {
                         num_returns: *num_returns,
@@ -1407,37 +1493,35 @@ impl AstGenerator {
                     if *num_returns == 0 {
                         statements.push(native);
                     } else {
-                        proto.stack.push(native);
+                        func.stack.push(native);
                     }
                 }
-                Opcode::Call { func_index, .. } => {
-                    let index = func_index.ok_or(anyhow!("Call did not have valid func index"))?;
-                    if proto.depth > 24 {
-                        return Err(anyhow!("Function recursively calls itself"));
+                Instruction::Call { func_index, .. } => {
+                    let index = func_index.ok_or(AstError::NoCallIndex)?;
+                    if func.depth > 24 {
+                        return Err(AstError::RecursionLimit { index: func_index.unwrap() });
                     }
                     let num_args = self.functions[index].num_args;
                     let mut args_list =
-                        proto
+                        func
                             .stack
-                            .pop(&mut statements, &mut proto.vars.temp, num_args as u32)?;
+                            .pop(&mut statements, &mut func.vars.temp, num_args as u32)?;
                     args_list.reverse();
-                    proto.depth += 1;
-                    let new_stack = AstStack::new();
-
+                    func.depth += 1;
                     let num_returns =
-                        match self.generate_function_with_stack(index, new_stack, proto.depth) {
+                        match self.get_number_of_returns(&self.functions[index].get_func()) {
                             Ok(res) => {
-                                proto.depth -= 1;
-                                Ok(res.num_returns)
+                                func.depth -= 1;
+                                Ok(res)
                             }
                             Err(e) => {
-                                proto.depth -= 1;
+                                func.depth -= 1;
                                 Err(e)
                             }
                         }?;
 
                     let call = Ast::Call {
-                        num_returns,
+                        num_returns: num_returns as u8,
                         args: args_list,
                         index: func_index.unwrap() as u32,
                     };
@@ -1445,13 +1529,13 @@ impl AstGenerator {
                     if num_returns == 0 {
                         statements.push(call);
                     } else {
-                        proto.stack.push(call);
+                        func.stack.push(call);
                     }
                 }
-                Opcode::Drop => {
-                    let ast = proto
+                Instruction::Drop => {
+                    let ast = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
                     if ast.get_stack_size() == 1 {
@@ -1461,90 +1545,90 @@ impl AstGenerator {
                         }
                     }
                 }
-                Opcode::Dup => {
+                Instruction::Dup => {
                     // Fixes Rockstar's jank conditionals
-                    if proto.instructions.len() - index > 2 {
-                        if matches!(proto.instructions[index + 1], Opcode::Inot)
-                            && matches!(proto.instructions[index + 2], Opcode::Jz { .. })
+                    if func.instructions.len() - index > 2 {
+                        if matches!(func.instructions[index + 1], Instruction::Inot)
+                            && matches!(func.instructions[index + 2], Instruction::Jz { .. })
                         {
                             index += 2;
                         }
 
-                        if matches!(proto.instructions[index + 1], Opcode::Jz { .. }) {
+                        if matches!(func.instructions[index + 1], Instruction::Jz { .. }) {
                             index += 1;
                         }
                     } else {
-                        let ast = proto
+                        let ast = func
                             .stack
-                            .pop(&mut statements, &mut proto.vars.temp, 1)?
+                            .pop(&mut statements, &mut func.vars.temp, 1)?
                             .pop()
                             .ok_or(err())?;
-                        proto.stack.push(ast.clone());
-                        proto.stack.push(ast);
+                        func.stack.push(ast.clone());
+                        func.stack.push(ast);
                     }
                 }
-                Opcode::Ine => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Ine => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntegerNotEqual {
+                    func.stack.push(Ast::IntegerNotEqual {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     })
                 }
-                Opcode::Feq => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Feq => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::FloatEqual {
+                    func.stack.push(Ast::FloatEqual {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     })
                 }
-                Opcode::Ieq => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Ieq => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
-                    proto.stack.push(Ast::IntegerEqual {
+                    func.stack.push(Ast::IntegerEqual {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     })
                 }
-                Opcode::String { value, .. } => {
-                    let string_index = proto
+                Instruction::String { value, .. } => {
+                    let string_index = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
-                    proto.stack.push(Ast::String {
+                    func.stack.push(Ast::String {
                         index: Box::new(string_index),
                         value: Some(value.clone()),
                     })
                 }
-                Opcode::LoadN => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::LoadN => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (size, address) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let size = if let Ast::ConstInt { val } = size {
                         val
                     } else {
-                        return Err(anyhow!("LoadN called with non-const size."));
+                        return Err(AstError::DynamicStackSize { opcode: inst.clone() });
                     };
 
-                    proto.stack.push(Ast::LoadN {
+                    func.stack.push(Ast::LoadN {
                         address: Box::new(address),
                         size: size as u32,
                     })
                 }
-                Opcode::StoreN => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::StoreN => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (size, lhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let size = if let Ast::ConstInt { val } = size {
                         val
                     } else {
-                        return Err(anyhow!("StoreN called with non-const size."));
+                        return Err(AstError::DynamicStackSize { opcode: inst.clone() });
                     };
 
                     let mut stack_items =
-                        proto
+                        func
                             .stack
-                            .pop(&mut statements, &mut proto.vars.temp, size as u32)?;
+                            .pop(&mut statements, &mut func.vars.temp, size as u32)?;
                     if stack_items.len() == 1 {
                         statements.push(Ast::Memcpy {
                             lhs: Box::new(lhs),
@@ -1565,8 +1649,8 @@ impl AstGenerator {
                         }
                     }
                 }
-                Opcode::Store => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::Store => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (rhs, lhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let lhs = Ast::Dereference { val: Box::new(lhs) };
 
@@ -1575,86 +1659,94 @@ impl AstGenerator {
                         rhs: Box::new(rhs),
                     })
                 }
-                Opcode::StoreRev => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::StoreRev => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let lhs = Ast::Dereference { val: Box::new(lhs) };
-                    proto.stack.push(lhs.clone());
+                    func.stack.push(lhs.clone());
                     statements.push(Ast::Store {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     })
                 }
-                Opcode::Inot => {
-                    let arg = proto
+                Instruction::Inot => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
-                    proto.stack.push(Ast::Not { val: Box::new(arg) });
+                    func.stack.push(Ast::Not { val: Box::new(arg) });
                 }
-                Opcode::Load => {
-                    let arg = proto
+                Instruction::Load => {
+                    let arg = func
                         .stack
-                        .pop(&mut statements, &mut proto.vars.temp, 1)?
+                        .pop(&mut statements, &mut func.vars.temp, 1)?
                         .pop()
                         .ok_or(err())?;
-                    proto.stack.push(Ast::Dereference { val: Box::new(arg) });
+                    func.stack.push(Ast::Dereference { val: Box::new(arg) });
                 }
-                Opcode::J { offset } if *offset == 0 => {}
-                Opcode::Jz { offset } if *offset >= 0 => {
+                Instruction::J { offset } if *offset == 0 => {}
+                Instruction::Jz { offset } if *offset >= 0 => {
                     let condition = Box::new(
-                        proto
+                        func
                             .stack
-                            .pop(&mut statements, &mut proto.vars.temp, 1)?
+                            .pop(&mut statements, &mut func.vars.temp, 1)?
                             .pop()
                             .ok_or(err())?,
                     );
-                    self.generate_if(condition, *offset, &mut index, &mut statements, proto)?;
+                    self.generate_if(condition, *offset, &mut index, &mut statements, func)?;
                 }
-                Opcode::IEqJz { offset } if *offset >= 0 => {
-                    let mut args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::IEqJz { offset } if *offset >= 0 => {
+                    let mut args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let (lhs, rhs) = (args.pop().ok_or(err())?, args.pop().ok_or(err())?);
                     let condition = Box::new(Ast::IntegerEqual {
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     });
-                    self.generate_if(condition, *offset, &mut index, &mut statements, proto)?;
+                    self.generate_if(condition, *offset, &mut index, &mut statements, func)?;
                 }
-                Opcode::INeJz { offset } if *offset >= 0 => {
-                    let args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::INeJz { offset } if *offset >= 0 => {
+                    let args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let condition = Box::new(Ast::IntegerNotEqual {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
                     });
-                    self.generate_if(condition, *offset, &mut index, &mut statements, proto)?;
+                    self.generate_if(condition, *offset, &mut index, &mut statements, func)?;
                 }
-                Opcode::IGtJz { offset } if *offset >= 0 => {
-                    let args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::IGtJz { offset } if *offset >= 0 => {
+                    let args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let condition = Box::new(Ast::IntGreaterThan {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
                     });
-                    self.generate_if(condition, *offset, &mut index, &mut statements, proto)?;
+                    self.generate_if(condition, *offset, &mut index, &mut statements, func)?;
                 }
-                Opcode::ILtJz { offset } if *offset >= 0 => {
-                    let args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::IGeJz { offset } if *offset >= 0 => {
+                    let args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
+                    let condition = Box::new(Ast::IntGreaterThanOrEq {
+                        lhs: Box::new(args[1].clone()),
+                        rhs: Box::new(args[0].clone()),
+                    });
+                    self.generate_if(condition, *offset, &mut index, &mut statements, func)?;
+                }
+                Instruction::ILtJz { offset } if *offset >= 0 => {
+                    let args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let condition = Box::new(Ast::IntLessThan {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
                     });
-                    self.generate_if(condition, *offset, &mut index, &mut statements, proto)?;
+                    self.generate_if(condition, *offset, &mut index, &mut statements, func)?;
                 }
-                Opcode::ILeJz { offset } if *offset >= 0 => {
-                    let args = proto.stack.pop(&mut statements, &mut proto.vars.temp, 2)?;
+                Instruction::ILeJz { offset } if *offset >= 0 => {
+                    let args = func.stack.pop(&mut statements, &mut func.vars.temp, 2)?;
                     let condition = Box::new(Ast::IntLessThanOrEq {
                         lhs: Box::new(args[1].clone()),
                         rhs: Box::new(args[0].clone()),
                     });
-                    self.generate_if(condition, *offset, &mut index, &mut statements, proto)?;
+                    self.generate_if(condition, *offset, &mut index, &mut statements, func)?;
                 }
                 _ => {
-                    return Err(anyhow!("unsupported opcode: {inst:?}"));
+                    return Err(AstError::UnsupportedOpcode { opcode: inst.clone() });
                 }
             }
 
@@ -1664,11 +1756,25 @@ impl AstGenerator {
         Ok((
             Ast::StatementList {
                 list: statements,
-                stack_size: proto.stack.len(),
+                stack_size: func.stack.len(),
             },
             returns,
-            proto.vars.clone(),
+            func.vars.clone(),
         ))
+    }
+
+    fn get_number_of_returns(&self, callee_func: &Function) -> Result<usize, AstError> {
+        let inst_iter = callee_func.instructions.iter().rev();
+
+        for inst in inst_iter {
+            if !matches!(&inst, Instruction::Leave { .. }) {
+                if let Some(size) = inst.get_stack_size() {
+                    return Ok(size as usize);
+                }
+            }
+        }
+
+        self.generate_function_with_stack(callee_func.function_index, AstStack::new(), 0).map(|x| x.num_returns as usize)
     }
 
     fn register_local_var(&self, func_index: usize, local_index: u8, local_vars: &mut u8) {
@@ -1678,7 +1784,7 @@ impl AstGenerator {
         }
     }
 
-    fn extract_functions(instructions: Vec<Opcode>) -> Vec<Function> {
+    fn extract_functions(instructions: Vec<Instruction>) -> Vec<ProtoFunction> {
         let mut instruction_start_index = 0;
 
         let mut last_arg_count = 0;
@@ -1687,13 +1793,13 @@ impl AstGenerator {
         let mut last_index = 0;
 
         for (instruction_end_index, (i, inst)) in instructions.iter().enumerate().enumerate() {
-            if let Opcode::Enter {
+            if let Instruction::Enter {
                 arg_count, index, ..
             } = inst
             {
                 last_index = index.unwrap() - 1;
                 if instruction_end_index != 0 {
-                    functions.push(Function {
+                    functions.push(ProtoFunction {
                         index: index.unwrap() - 1,
                         num_args: last_arg_count,
                         instructions: instructions[instruction_start_index..instruction_end_index]
@@ -1705,7 +1811,7 @@ impl AstGenerator {
             }
         }
 
-        functions.push(Function {
+        functions.push(ProtoFunction {
             index: last_index,
             num_args: last_arg_count,
             instructions: instructions[instruction_start_index..].to_vec(),
@@ -1716,7 +1822,7 @@ impl AstGenerator {
 }
 
 impl TryFrom<YSCScript> for AstGenerator {
-    type Error = Error;
+    type Error = AstError;
     fn try_from(value: YSCScript) -> std::result::Result<Self, Self::Error> {
         let instructions = Disassembler::new(&value).disassemble(None)?.instructions;
         let ast_gen = Self {

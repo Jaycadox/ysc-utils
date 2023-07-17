@@ -1,4 +1,4 @@
-use anyhow::{Context, Error, Result};
+use anyhow::{Error, Result};
 use ysc_utils::ysc::YSCScript;
 
 fn main() {
@@ -15,7 +15,7 @@ fn start() -> Result<(), Error> {
         return Ok(());
     }
     let script =
-        YSCScript::from_ysc_file(&args[0]).context("Failed to read/parse/disassemble ysc file")?;
+        YSCScript::from_ysc_file(&args[0])?;
 
     for (_i, string) in script.strings.iter() {
         println!("{string}");
