@@ -23,6 +23,10 @@ pub enum DisassembleError {
     /// Generic ysc error
     #[error("ysc error")]
     YscError(#[from] YscError),
+
+    /// Bad native call
+    #[error("bad native call (out of bounds)")]
+    BadNativeCall,
 }
 
 /// A global reference with one or more offsets
@@ -471,7 +475,7 @@ impl<'a> Disassembler<'a> {
                     num_args,
                     num_returns,
                     native_table_index,
-                    native_hash: self.script.native_table[native_table_index as usize],
+                    native_hash: *self.script.native_table.get(native_table_index as usize).ok_or(DisassembleError::BadNativeCall)?,
                 })
             }
             RawOpcode::Enter => {
