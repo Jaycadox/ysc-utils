@@ -11,12 +11,16 @@ fn main() {
 }
 
 fn start() -> Result<(), Error> {
-    let args = std::env::args().skip(1).collect::<Vec<String>>();
+    let mut args = std::env::args().skip(1).collect::<Vec<String>>();
+    let old_format = !args.is_empty() && args[0] == "--old";
+    if old_format {
+        args.remove(0);
+    }
 
     if args.is_empty() || args.len() > 2 {
         println!("Usage: basic_disassemble %ysc_script% (optional: function number/index)");
         println!("Example  : basic_disasemble freemode.ysc.full");
-        println!("Example 2: basic_disasemble freemode.ysc.full func_305");
+        println!("Example 2: basic_disasemble --old freemode.ysc.full func_305");
         return Ok(());
     }
 
@@ -32,8 +36,10 @@ fn start() -> Result<(), Error> {
         let val: usize = index.replace("func_", "").parse()?;
         func_index = Some(val + 1);
     }
+    let mut disasm = Disassembler::new(&script);
+    disasm.old_format = old_format;
 
-    let script = Disassembler::new(&script).disassemble(func_index)?;
+    let script = disasm.disassemble(func_index)?;
 
     for inst in script.instructions {
         let mut padding = "".to_owned();

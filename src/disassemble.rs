@@ -17,7 +17,7 @@ pub enum DisassembleError {
     IOError(#[from] std::io::Error),
 
     /// An byte we read does not seem to have a corresponding opcode
-    #[error("bad opcode")]
+    #[error("bad opcode -- try using `old_format`")]
     BadOpcode(#[from] ::num_enum::TryFromPrimitiveError<RawOpcode>),
 
     /// Generic ysc error
@@ -326,6 +326,8 @@ impl InstructionList {
 /// ScriptVM disassembler
 pub struct Disassembler<'a> {
     script: &'a YSCScript,
+    /// Newer GTAV YSC scripts have new opcodes which cause misalignment when inputting an older script, enabling this will translate old format scripts to new format scripts
+    pub old_format: bool,
     current_stack_top: i64,
 }
 
@@ -335,6 +337,7 @@ impl<'a> Disassembler<'a> {
     pub fn new(script: &'a YSCScript) -> Self {
         Self {
             script,
+            old_format: false,
             current_stack_top: 0,
         }
     }
@@ -354,7 +357,13 @@ impl<'a> Disassembler<'a> {
         let mut inst;
 
         while cursor.position() < self.script.code.len() as u64 {
-            let raw = RawOpcode::try_from(cursor.read_u8()?)?;
+            let mut byte = cursor.read_u8()?;
+
+            if self.old_format && byte >= RawOpcode::LocalU24 as u8 {
+                byte += 3;
+            }
+
+            let raw = RawOpcode::try_from(byte)?;
 
             let mut is_enter_opcode = false;
             if let RawOpcode::Enter = &raw {
